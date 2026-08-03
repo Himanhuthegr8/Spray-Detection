@@ -1,0 +1,959 @@
+﻿#include "spray_segmentation.h"
+#include <iostream>     // std::cout
+#include <numeric>      // std::iota
+#include "opencv2/core.hpp"
+
+
+const int MAX_FEATURES = 500;
+const float GOOD_MATCH_PERCENT = 0.15f;
+
+#define Input_Data_Path "../Data_Input/Spray_Atomizer/a6_20x70/" 
+#define Image_Sequence Input_Data_Path "a6_20x70_%04d.png"//"cropped_0%03d.png"
+#define Result_Folder "All_Results/" 
+#define Save_ImgSequence "All_Img_%04d.png"
+
+void mosaic_display_save(const int _x_m, const int _y_m, Mat* _img_m, int show_flag, int save_flag, int _id);
+std::vector<int>get_largest_contour(Mat in_img, Mat in_gray_img, Mat out_color_img, Mat out_color_filled_img, Mat out_color_cropped_img);
+std::vector<int>get_contour(int thre, Mat in_img, Mat in_gray_img, Mat out_color_all_img, Mat out_color_img, Mat out_color_filled_img, Mat out_color_cropped_img);
+void  get_flowAnalysis_cropped_boundary(int _id, Mat curr_img, Mat pre_img, Mat contour_img, Mat of_img, Mat avg_of_img, int cell, int _arrow, int type);
+
+void alignImages(Mat& im1, Mat& im2, Mat& im1Reg, Mat& h);
+void ContourMatch(Mat pre_img, Mat cur_img);
+std::vector<vector<Point>> ContoursMatching(int thre, Mat pre_img, Mat cur_img, Mat bw_1, Mat bw_2, Mat matched_cont, Mat out_color_all_img, Mat out_color_img, Mat cur_pre_img);
+void track(Mat in_img, int thre, int area);
+void SingleParticle(Mat in_img, Mat out_img, int thre, int area, int frame);
+void MultiParticle(Mat in_img, Mat out_img, int thre, int area, int frame);
+
+
+int dilation_elem = 0;
+int dilation_size = 1, max_dilation_size = 255;
+int erosion_elem = 0;
+int erosion_size = 1, max_erosion_size = 255;
+Mat erosion_dst, dilation_dst;
+
+int hog_a = 30, hog_b = 1, hog_c = 30, max_hog = 1000;
+
+// 定数
+const int tempThres = 100;           // テンプレート二値化閾値
+const int srcThres = 100;           // 入力画像二値化閾値
+//const double huMomentThres = 0.4;  // 形状マッチングの閾値
+
+int huMomentThres = 2, max_huMomentThres = 100;
+
+
+int main() {
+
+
+    int t = 0, frame_img = t, max_frame_img = 1999;
+    int thre_1 = 120, thre_2 = 60, thre_3 = 218, max_thre = 300;
+    int area = 5000, max_area = 10000;
+
+
+
+    namedWindow("Result", 0);
+    createTrackbar("Frames", "Result", &frame_img, max_frame_img);
+    createTrackbar("B_Thre_1", "Result", &thre_1, max_thre);
+    createTrackbar("area", "Result", &area, max_area);
+
+   // createTrackbar("B_Thre_2", "Result", &thre_2, max_thre);
+    //createTrackbar("Match_Thre", "Result", &huMomentThres, max_huMomentThres);
+    /*createTrackbar("hog_a", "Result", &hog_a, max_hog);
+    createTrackbar("hog_b", "Result", &hog_b, max_hog);
+    createTrackbar("hog_c", "Result", &hog_c, max_hog);*/
+
+
+    //createTrackbar("Dilation", "Result", &dilation_size, max_dilation_size);
+    //createTrackbar("Ero_size", "Result", &erosion_size, max_erosion_size);
+
+
+    const int  X_mosaic = 5, Y_mosaic = 1;
+    Mat _images_mosaic[X_mosaic * Y_mosaic];
+    Mat frame, out_frame, pre_frame, frame_threshold_img, boundary_img, multi_boundary_img, single_boundary_img, corrected_multi_boundary_img, corrected_curpre_boundary_img, color_frame, color_frame_threshold_img, cropped_boundary_img;
+    Mat opticalFlow_img, opticalFlowavg_img, pre_tracked_img;
+    Mat BG_frame, sub_img;
+    Mat sec_frame, third_frame, forth_frame;
+    Mat sec_frame_temp, third_frame_temp;
+   
+
+    char image_name[1000];
+
+    while (waitKey(1) != 27) {
+
+        sprintf_s(image_name, sizeof(image_name), Image_Sequence, t);
+        frame = imread(image_name, IMREAD_ANYCOLOR);
+        BG_frame=imread("2.png", IMREAD_ANYCOLOR);
+        Mat BG_frame_1 = imread("back000010.png", IMREAD_ANYCOLOR);
+
+
+        cv::subtract(BG_frame, frame, sub_img);
+        if (frame.empty()) break;
+
+        sec_frame_temp = sec_frame;
+        third_frame_temp = third_frame;
+
+        cv::threshold(frame, frame_threshold_img, thre_1, 255, THRESH_BINARY_INV);
+
+        cvtColor(frame_threshold_img, frame_threshold_img, COLOR_BGR2GRAY);
+        Mat test1;
+        frame.copyTo(test1);
+        frame.copyTo(boundary_img);
+        frame.copyTo(single_boundary_img);
+        frame.copyTo(multi_boundary_img);
+        frame.copyTo(corrected_multi_boundary_img);
+        frame.copyTo(corrected_curpre_boundary_img);
+       // auto contoured_array = get_contour(thre_1, frame, frame_threshold_img, boundary_img, corrected_multi_boundary_img, single_boundary_img, cropped_boundary_img);
+        // boundary_img.copyTo(multi_boundary_img);
+
+
+        if (pre_frame.empty()) frame.copyTo(pre_frame);
+        //-------------------SURF Feature-based Matching
+        Mat img_matches, h;
+        // Align images
+        //alignImages(frame, pre_frame, img_matches, h);
+
+        //-- Show detected matches
+       // imshow("Matches", img_matches);
+        //-------------------SURF Feature-based Matching
+
+        //-------------------Connected components contour matching
+        //ContourMatch(pre_frame, frame);
+        //-------------------Connected components contour matching
+
+        //-----get countours in the form of boundary, filled contours and cropped contours
+        Mat matched_contour = frame.clone();
+        Mat binary_1 = Mat::zeros(frame.rows, frame.cols, CV_8UC1);
+        Mat binary_2 = Mat::zeros(frame.rows, frame.cols, CV_8UC1);
+        Mat binary_3 = Mat::zeros(frame.rows, frame.cols, CV_8UC1);
+
+
+
+        auto countout_ = ContoursMatching(thre_1, pre_frame, frame, binary_1, binary_2, matched_contour, multi_boundary_img, corrected_multi_boundary_img, corrected_curpre_boundary_img);
+
+        cv::threshold(sub_img, binary_3, thre_2, 255, THRESH_BINARY);
+
+      //  track(frame, thre_1, area);
+
+        Mat out_frame;
+        frame.copyTo(out_frame);
+
+        SingleParticle(frame, out_frame, thre_1, area, t);
+       // MultiParticle(frame, out_frame, thre_1, area, t);
+
+
+       // imshow("sub_img", sub_img);
+       // imshow("binary_3", binary_3);
+
+        //-----get countours in the form of boundary, filled contours and cropped contours
+
+        //for (int i = 0; i < countout_.size(); ++i)
+        //{
+        //    cv::drawContours(test1, countout_, i, Scalar(255, 0, 255), -1, 8, 1,0, cv::Point());//filled contours
+        //}
+
+        //imshow("2", test1);
+
+
+
+
+        //-----mosaicked img
+        _images_mosaic[0] = frame;  _images_mosaic[1] = corrected_multi_boundary_img; _images_mosaic[2] = corrected_curpre_boundary_img; _images_mosaic[3] = matched_contour; _images_mosaic[4] = out_frame;
+       // _images_mosaic[4] = BG_frame;  _images_mosaic[5] = binary_1; _images_mosaic[6] = binary_2; _images_mosaic[7] = binary_3;//_images_mosaic[3] = opticalFlow_img; _images_mosaic[4] = tracked_img; _images_mosaic[5] = tracked_opticalFlow_img;
+
+        //_images_mosaic[3] = opticalFlow_img; _images_mosaic[4] = tracked_img; _images_mosaic[5] = tracked_opticalFlow_img;
+       // _images_mosaic[0] = frame;  _images_mosaic[1] = frame_threshold_img; _images_mosaic[2] = matched_contour;//_images_mosaic[3] = opticalFlow_img; _images_mosaic[4] = tracked_img; _images_mosaic[5] = tracked_opticalFlow_img;
+
+        mosaic_display_save(X_mosaic, Y_mosaic, _images_mosaic, 1, 1, t);
+        //-----mosaicked img
+        //t = frame_img; if (t >= 1999) t = 0;
+        t++; //if (t == 1999) t = 0;
+
+        sec_frame = frame; 
+        third_frame = sec_frame_temp;
+        forth_frame= third_frame_temp;
+        pre_frame = forth_frame;
+
+
+
+    }
+
+    destroyAllWindows();
+    return 0;
+}
+
+void mosaic_display_save(const int _x_m, const int _y_m, Mat* _img_m, int show_flag, int save_flag, int _id) {
+    //namedWindow("Cluster_Result", 0);
+
+    const int single_frame_width = _img_m[0].cols, single_frame_height = _img_m[0].rows;
+    const int Mosaic_width = single_frame_width * _x_m, Mosaic_height = single_frame_height * _y_m;
+    Mat All_Results(Mosaic_height, Mosaic_width, CV_8UC3);
+    char szSave[10][200];
+    int k = 0;
+
+    for (int i = 0; i < _x_m * _y_m; i++) {
+        rectangle(_img_m[i], Point(0, 0), Point(_img_m->cols, _img_m->rows), Scalar(255, 255, 255), 1, 1);
+    }
+
+    for (int i = 0; i < _x_m * _y_m; i++) {
+        if (_img_m[i].channels() == 1) cvtColor(_img_m[i], _img_m[i], COLOR_GRAY2BGR);
+    }
+    for (int h_pos = 0; h_pos < _y_m; h_pos++) {
+        for (int w_pos = 0; w_pos < _x_m; w_pos++) {
+            _img_m[k].copyTo(All_Results
+                .rowRange(h_pos * single_frame_height, h_pos * single_frame_height + single_frame_height)
+                .colRange(w_pos * single_frame_width, w_pos * single_frame_width + single_frame_width));
+
+            k++;
+        }
+    }
+
+    if (save_flag == 1) {
+        sprintf_s(szSave[0], sizeof(szSave[0]), "All_Images/seg_%04d.png", _id); //"All_Images/All_Img_%04d.png
+        cv::imwrite(szSave[0], All_Results);
+    }
+
+    if (show_flag == 1) cv::imshow("Result", All_Results);
+}
+
+std::vector<int>get_contour(int thre, Mat in_img, Mat in_gray_img, Mat out_color_all_img, Mat out_color_img, Mat out_color_filled_img, Mat out_color_cropped_img) {
+    std::vector<int> array_data(4);
+    vector<vector<Point>> contours;
+    vector<vector<Point>> contours_1;
+
+    std::vector<cv::Vec4i> hierarchy;
+    std::vector<cv::Vec4i> hierarchy_1;
+
+    int largest_area = 0, largest_contour_index = 0;
+    Mat mask, gray;
+
+    in_img.copyTo(mask);
+    cv::findContours(in_gray_img.clone(), contours, hierarchy, cv::RETR_TREE, cv::CHAIN_APPROX_NONE);
+
+    for (int i = 0; i < contours.size(); ++i)
+    {
+        cv::drawContours(out_color_all_img, contours, i, Scalar(255, 0, 255), 1, 8, hierarchy, 0, cv::Point()); // get max area boundary
+        cv::drawContours(mask, contours, i, Scalar(255, 0, 255), -1, 8, hierarchy, 0, cv::Point()); // get max area boundary
+
+        double a = contourArea(contours[i], false);  //Find the area of contour
+    }
+
+    cvtColor(mask, gray, COLOR_BGR2GRAY);
+    cv::threshold(gray, gray, thre, 255, THRESH_BINARY_INV);
+    ////Dilation
+    //Mat element = getStructuringElement(MORPH_ELLIPSE, Size(2 * dilation_size + 1, 2 * dilation_size + 1), Point(dilation_size, dilation_size)); //MORPH_RECT //MORPH_CROSS// MORPH_ELLIPSE
+    //cv::dilate(gray, dilation_dst, element);
+    ////Dilation
+    //// 
+    //// erosion_type = MORPH_RECT/MORPH_CROSS/MORPH_ELLIPSE
+    //Mat element_erosion = getStructuringElement(MORPH_RECT, Size(2 * erosion_size + 1, 2 * erosion_size + 1), Point(erosion_size, erosion_size));
+    //erode(dilation_dst, erosion_dst, element_erosion);
+    //// erosion
+    cv::findContours(gray.clone(), contours_1, hierarchy_1, cv::RETR_TREE, cv::CHAIN_APPROX_NONE);
+
+    for (int j = 0; j < contours_1.size(); ++j)
+    {
+        cv::drawContours(out_color_img, contours_1, j, Scalar(255, 0, 255), 1, 8, hierarchy_1, 0, cv::Point()); // get max area boundary
+    }
+
+    return array_data;
+}
+
+
+std::vector<int>get_largest_contour(Mat in_img, Mat in_gray_img, Mat out_color_img, Mat out_color_filled_img, Mat out_color_cropped_img) {
+    std::vector<int> array_data(4);
+    vector<vector<Point>> contours;
+    std::vector<cv::Vec4i> hierarchy;
+    int largest_area = 0, largest_contour_index = 0;
+
+    cv::findContours(in_gray_img.clone(), contours, hierarchy, cv::RETR_TREE, cv::CHAIN_APPROX_NONE);
+
+    for (int i = 0; i < contours.size(); ++i)
+    {
+        double a = contourArea(contours[i], false);  //Find the area of contour
+        if (a > largest_area) largest_area = a, largest_contour_index = i;
+    }
+    vector<vector<Point> > contours_poly(contours.size());
+    vector<Rect> boundRect(contours.size());
+    if (contours.size() != 0) {
+        cv::drawContours(out_color_img, contours, largest_contour_index, Scalar(255, 255, 0), 1, 8, hierarchy, 0, cv::Point()); // get max area boundary
+        cv::drawContours(out_color_filled_img, contours, largest_contour_index, Scalar(255, 255, 255), -1, 8, hierarchy, 0, cv::Point()); // get max area boundary
+        approxPolyDP(Mat(contours[largest_contour_index]), contours_poly[largest_contour_index], 3, true);
+        boundRect[largest_contour_index] = boundingRect(Mat(contours_poly[largest_contour_index]));
+        //cv::rectangle(out_color_cropped_img, boundRect[largest_contour_index].tl(), boundRect[largest_contour_index].br(), Scalar(0, 0, 255), 2, 8, 0); //Draws the actual rectangle around the contours
+
+        array_data[0] = (int)boundRect[largest_contour_index].tl().x;
+        array_data[1] = (int)boundRect[largest_contour_index].tl().y;
+        array_data[2] = (int)boundRect[largest_contour_index].br().x;
+        array_data[3] = (int)boundRect[largest_contour_index].br().y;
+    }
+
+
+    Mat contour_gray_img;
+    cv::cvtColor(out_color_filled_img, contour_gray_img, COLOR_BGR2GRAY);
+    for (int y = 0; y < contour_gray_img.rows; y++) {
+        for (int x = 0; x < contour_gray_img.cols; x++) {
+            if (contour_gray_img.data[y * contour_gray_img.cols + x] == 255) {
+                out_color_cropped_img.at<Vec3b>(Point(x, y)) = in_img.at<Vec3b>(Point(x, y));
+            }
+        }
+    }
+    //----------crop input image using contour
+
+    return array_data;
+}
+
+void  get_flowAnalysis_cropped_boundary(int _id, Mat curr_img, Mat pre_img, Mat contour_img, Mat of_img, Mat avg_of_img, int cell, int _arrow, int type) {
+    const int buff = 7;
+    UINT32 avg_vector[4][buff];
+
+    Mat bn_flow(curr_img.size(), CV_32FC2);
+    Point bn_ptBegin, bn_ptEnd, bn_ptVec, bn_ptAllowCW, bn_ptAllowCCW;
+    Point ptEnd, ptVec;
+
+    cvtColor(curr_img, curr_img, COLOR_BGR2GRAY);
+    cvtColor(pre_img, pre_img, COLOR_BGR2GRAY);
+
+
+    calcOpticalFlowFarneback(pre_img, curr_img, bn_flow, 0.1 * py_scale, levels, W_Size, iterations, 5, 1.2, 0);
+
+    for (int b = 0; b < buff; b++) {
+        avg_vector[0][b] = 0; avg_vector[1][b] = 0; avg_vector[2][b] = 0; avg_vector[3][b] = 0;
+    }
+
+    Mat contour_gray_img;
+    cv::cvtColor(contour_img, contour_gray_img, COLOR_BGR2GRAY);
+    for (int y = 0; y < contour_gray_img.rows; y += cell) {
+        for (int x = 0; x < contour_gray_img.cols; x += cell) {
+            if (contour_gray_img.data[y * contour_gray_img.cols + x] == 255) {
+                //  const Point2f bn_flowatxy, flowatxy;
+                if (type == 0) _arrow = 5;
+                else _arrow = 5;
+                Point2f bn_flowatxy = bn_flow.at<Point2f>(y, x) * _arrow;
+                const Point2f flowatxy = bn_flow.at<Point2f>(y, x);
+                bn_ptBegin.x = x;
+                bn_ptBegin.y = y;
+
+                ptEnd.x = cvRound(x + flowatxy.x);
+                ptEnd.y = cvRound(y + flowatxy.y);
+
+                bn_ptEnd.x = cvRound(x + bn_flowatxy.x);
+                bn_ptEnd.y = cvRound(y + bn_flowatxy.y);
+
+                bn_ptVec.x = bn_ptEnd.x - bn_ptBegin.x;
+                bn_ptVec.y = bn_ptEnd.y - bn_ptBegin.y;
+
+                bn_ptVec.x = bn_ptVec.x / 2;
+                bn_ptVec.y = bn_ptVec.y / 2;
+                if (bn_ptVec.x != 0 || bn_ptVec.y != 0) {
+                    double bn_SinTheta = sqrt(2.) / 2.;
+                    double bn_CosTheta = sqrt(2.) / 2.;
+                    bn_ptAllowCW.x = (int)(-1 / 2. * bn_ptVec.x * bn_CosTheta + -1 / 2. * bn_ptVec.y * bn_SinTheta + 0.5);
+                    bn_ptAllowCW.y = (int)(-1 / 2. * bn_ptVec.x * -bn_SinTheta + -1 / 2. * bn_ptVec.y * bn_CosTheta + 0.5);
+                    bn_ptAllowCCW.x = (int)(-1 / 2. * bn_ptVec.x * bn_CosTheta - -1 / 2. * bn_ptVec.y * bn_SinTheta + 0.5);
+                    bn_ptAllowCCW.y = (int)(-1 / 2. * bn_ptVec.x * bn_SinTheta + -1 / 2. * bn_ptVec.y * bn_CosTheta + 0.5);
+
+                    //-------if scene is static
+                    circle(of_img, bn_ptBegin, 1, Scalar(0, 255, 0), 2);
+                    cv::line(of_img, bn_ptEnd, bn_ptBegin, CV_RGB(255, 0, 0), 2);
+                    cv::line(of_img, bn_ptEnd, Point(bn_ptEnd.x + bn_ptAllowCW.x, bn_ptEnd.y + bn_ptAllowCW.y), CV_RGB(255, 0, 0), 2);
+                    cv::line(of_img, bn_ptEnd, Point(bn_ptEnd.x + bn_ptAllowCCW.x, bn_ptEnd.y + bn_ptAllowCCW.y), CV_RGB(255, 0, 0), 2);
+                    //-------if scene is static
+                }
+
+            }
+        }
+    }
+
+}
+
+
+
+std::vector<vector<Point>> ContoursMatching(int thre, Mat pre_img, Mat cur_img, Mat bw_1, Mat bw_2, Mat matched_cont, Mat out_color_all_img, Mat out_color_img, Mat cur_pre_img) {
+
+    /*Method to avoid contours inside contours:
+    * Binarize-->Find contour-->draw filled contours
+    * Binarize filled contours-->find contour
+    *
+    * Contour Area Matching:
+    * Getcontours of consecutive images-->find similarity and threshold selection based on similarity index
+    * Draw bounding box over matched particles same as current image
+    */
+    cv::Mat pre_color_img = pre_img.clone();
+    cv::Mat cur_color_img = cur_img.clone();
+    cv::Mat mask_pre = pre_img.clone();
+    cv::Mat mask_cur = cur_img.clone();
+    cv::Mat hog_cirlce = cur_img.clone();
+    cv::Mat Defect_points = cur_img.clone();
+
+    cv::Mat gray_pre, gray_cur;
+    ostringstream oss;
+    vector<vector<Point>> cont_;
+
+    int largest_area = 0, largest_contour_index = 0;
+
+    if (pre_img.channels() == 3) cvtColor(pre_img, pre_img, COLOR_BGR2GRAY);
+    if (cur_img.channels() == 3) cvtColor(cur_img, cur_img, COLOR_BGR2GRAY);
+    if (hog_cirlce.channels() == 3) cvtColor(hog_cirlce, hog_cirlce, COLOR_BGR2GRAY);
+
+    cv::threshold(pre_img, pre_img, thre, 255, THRESH_BINARY_INV);
+    cv::threshold(cur_img, cur_img, thre, 255, THRESH_BINARY_INV);
+
+    cur_img.copyTo(bw_1);
+
+
+    vector<vector<Point>> contours_pre;
+    vector<vector<Point>> contours_cur;
+    vector<vector<Point>> contours_pre_pre;
+    vector<vector<Point>> contours_cur_cur;
+
+
+    std::vector<cv::Vec4i> hierarchy_pre;
+    std::vector<cv::Vec4i> hierarchy_cur;
+    std::vector<cv::Vec4i> hierarchy_pre_pre;
+    std::vector<cv::Vec4i> hierarchy_cur_cur;
+
+
+    std::vector<cv::Rect> roiRects;
+
+    cv::findContours(pre_img.clone(), contours_pre, hierarchy_pre, cv::RETR_TREE, cv::CHAIN_APPROX_NONE);
+    cv::findContours(cur_img.clone(), contours_cur, hierarchy_cur, cv::RETR_TREE, cv::CHAIN_APPROX_NONE);
+
+
+
+
+    for (int i = 0; i < contours_pre.size(); ++i) {
+        cv::drawContours(mask_pre, contours_pre, i, Scalar(255, 0, 255), -1, 8, hierarchy_pre, 0, cv::Point()); // filled contorus
+    }
+
+
+    for (int i = 0; i < contours_cur.size(); ++i) {
+        cv::drawContours(out_color_all_img, contours_cur, i, Scalar(255, 0, 255), 1, 8, hierarchy_cur, 0, cv::Point());// hollow contours
+        cv::drawContours(mask_cur, contours_cur, i, Scalar(255, 0, 255), -1, 8, hierarchy_cur, 0, cv::Point());//filled contours
+    }
+
+
+    cvtColor(mask_pre, gray_pre, COLOR_BGR2GRAY);
+    cvtColor(mask_cur, gray_cur, COLOR_BGR2GRAY);
+
+    cv::threshold(gray_pre, gray_pre, thre, 255, THRESH_BINARY_INV);
+    cv::threshold(gray_cur, gray_cur, thre, 255, THRESH_BINARY_INV);
+
+    gray_cur.copyTo(bw_2);
+
+
+    cv::findContours(gray_pre.clone(), contours_pre_pre, hierarchy_pre_pre, cv::RETR_TREE, cv::CHAIN_APPROX_NONE);
+    cv::findContours(gray_cur.clone(), contours_cur_cur, hierarchy_cur_cur, cv::RETR_TREE, cv::CHAIN_APPROX_NONE);
+
+    vector<vector<Point>> contours_poly_cur(contours_cur_cur.size());
+
+    vector<Rect> boundRect_cur(contours_cur_cur.size());
+    vector<Point2f>centers_cur(contours_cur_cur.size());
+    vector<float>radius_cur(contours_cur_cur.size());
+    vector<Moments> mu(contours_cur_cur.size());
+    vector<Point2f> mc(contours_cur_cur.size());
+    vector<vector<Point> >hull(contours_cur_cur.size());
+    std::vector<RotatedRect> minRect(contours_cur_cur.size());
+
+   
+    for (int i = 0; i < contours_pre_pre.size(); ++i) {
+        cv::drawContours(cur_pre_img, contours_pre_pre, i, Scalar(0, 255, 0), 1, 8, hierarchy_pre, 0, cv::Point());
+    }
+    for (int i = 0; i < contours_cur_cur.size(); ++i)
+    {
+        Mat empty_temp_1 = Mat::zeros(cur_pre_img.rows, cur_pre_img.cols, CV_8UC3);
+
+        //-----convert "vector<vector<Point>>" --> "Point*"
+         /*
+         Point* countour_points = new Point[contours_cur_cur[i].size()];// dynamic memory to the pointer to cv_point
+         for (int j = 0; j < contours_cur_cur[i].size(); j++)
+         {
+                countour_points[j] = contours_cur_cur[i][j]; // convert "vector<vector<Point>>" --> "Point*"
+
+                //line(out_color_img, countour_points[j], countour_points[j - 1], Scalar(0, 255, 0), 2);
+                //circle(out_color_img, countour_points[j], 6, Scalar(0, 255, 255), 2);//moment centroid
+                cout << countour_points[j] << endl; //do whatever
+         }
+         */
+         //-----convert "vector<vector<Point>>" --> "Point*"
+
+
+
+
+        cv::drawContours(cur_pre_img, contours_cur_cur, i, Scalar(0, 0, 255), 1, 8, hierarchy_cur, 0, cv::Point());
+
+        float Arc_Length = arcLength(contours_cur_cur[i], true);
+        approxPolyDP(Mat(contours_cur_cur[i]), contours_poly_cur[i], 3, true);
+        boundRect_cur[i] = boundingRect(Mat(contours_poly_cur[i]));
+        minEnclosingCircle(contours_poly_cur[i], centers_cur[i], radius_cur[i]);
+        minRect[i] = minAreaRect(contours_cur_cur[i]); // get min area for drawing rectangle
+
+
+        // circle(out_color_img, centers_cur[i], 6, Scalar(255,255,255), 2);//contour center
+        mu[i] = moments(contours_cur_cur[i], false);
+        mc[i] = Point2f(mu[i].m10 / mu[i].m00, mu[i].m01 / mu[i].m00);
+
+        if (contours_cur_cur[i].size() != 0)
+        {
+            cv::drawContours(empty_temp_1, contours_cur_cur, i, Scalar(255, 255, 255), 1, 8, hierarchy_cur, 0, cv::Point());
+         }
+
+        circle(empty_temp_1, mc[i], 2, Scalar(255, 255, 255), 2);//moment centroid
+        int intersect = 0;
+        for (int j = 0; j < contours_cur_cur[i].size(); j++)
+        {
+            if (contours_cur_cur[i][j].x > (int)mc[i].x && (int)mc[i].y == contours_cur_cur[i][j].y) {
+                //line(empty_temp_1, mc[i], Point(contours_cur_cur[i][j].x, mc[i].y), Scalar(255, 255, 255), 2);
+                cont_.push_back(contours_cur_cur[i]);
+                intersect++;
+            }
+
+            
+        }
+        //cout << "intersect=" << intersect << endl;
+        if (intersect !=0) {
+            // putText(out_color_img, oss.str().c_str(), mc[i], FONT_HERSHEY_PLAIN, 2, Scalar(0, 255, 255), 2);
+            cv::drawContours(out_color_img, contours_cur_cur, i, Scalar(255, 0, 0), 1, 8, hierarchy_cur_cur, 0, cv::Point());
+            //circle(out_color_img, mc[i], 2, Scalar(255, 255, 255), 2);//moment centroid
+        }
+        if (intersect == 1) {
+            // putText(out_color_img, oss.str().c_str(), mc[i], FONT_HERSHEY_PLAIN, 2, Scalar(0, 255, 255), 2);
+            cv::drawContours(out_color_img, contours_cur_cur, i, Scalar(0, 255, 0), 1, 8, hierarchy_cur_cur, 0, cv::Point());
+            //circle(out_color_img, mc[i], 2, Scalar(255, 255, 255), 2);//moment centroid
+        }
+        //if (intersect == 2) {
+        //    // putText(out_color_img, oss.str().c_str(), mc[i], FONT_HERSHEY_PLAIN, 2, Scalar(0, 255, 255), 2);
+        //    cv::drawContours(out_color_img, contours_cur_cur, i, Scalar(0, 0, 255), 1, 8, hierarchy_cur_cur, 0, cv::Point());
+        //    //circle(out_color_img, mc[i], 2, Scalar(255, 255, 255), 2);//moment centroid
+        //}
+        //if (intersect == 3) {
+        //    // putText(out_color_img, oss.str().c_str(), mc[i], FONT_HERSHEY_PLAIN, 2, Scalar(0, 255, 255), 2);
+        //    cv::drawContours(out_color_img, contours_cur_cur, i, Scalar(255, 255, 0), 1, 8, hierarchy_cur_cur, 0, cv::Point());
+        //    //circle(out_color_img, mc[i], 2, Scalar(255, 255, 255), 2);//moment centroid
+        //}
+
+        //if (intersect == 4) {
+        //    // putText(out_color_img, oss.str().c_str(), mc[i], FONT_HERSHEY_PLAIN, 2, Scalar(0, 255, 255), 2);
+        //    cv::drawContours(out_color_img, contours_cur_cur, i, Scalar(0, 255, 255), 1, 8, hierarchy_cur_cur, 0, cv::Point());
+        //    //circle(out_color_img, mc[i], 2, Scalar(255, 255, 255), 2);//moment centroid
+        //}
+
+        //if (intersect == 5) {
+        //    // putText(out_color_img, oss.str().c_str(), mc[i], FONT_HERSHEY_PLAIN, 2, Scalar(0, 255, 255), 2);
+        //    cv::drawContours(out_color_img, contours_cur_cur, i, Scalar(0, 155, 125), 1, 8, hierarchy_cur_cur, 0, cv::Point());
+        //    //circle(out_color_img, mc[i], 2, Scalar(255, 255, 255), 2);//moment centroid
+        //}
+
+
+
+
+       // convexHull(contours_cur_cur[i], hull[i]);
+        //convexHull(contours_cur_cur[i], hull_topo[i], true);
+
+
+
+
+      
+        int x = boundRect_cur[i].tl().x;
+        int y = boundRect_cur[i].tl().y;
+        int width = (boundRect_cur[i].br().x - boundRect_cur[i].tl().x);
+        int height = (boundRect_cur[i].br().y - boundRect_cur[i].tl().y);
+        roiRects.push_back(cv::Rect(x, y, width, height));
+
+
+
+        approxPolyDP(Mat(contours_cur_cur[i]), contours_poly_cur[i], 3, true);
+        int obj_corners = (int)contours_poly_cur[i].size();
+        oss.str("");
+        oss << obj_corners;
+      
+
+        //if (obj_corners < 5) {
+        //    // putText(out_color_img, oss.str().c_str(), mc[i], FONT_HERSHEY_PLAIN, 2, Scalar(0, 255, 255), 2);
+        //    cv::drawContours(out_color_img, contours_cur_cur, i, Scalar(0, 0, 255), 1, 8, hierarchy_cur_cur, 0, cv::Point());
+
+        //}
+        //else {
+
+        //   
+        //    // putText(out_color_img, oss.str().c_str(), mc[i], FONT_HERSHEY_PLAIN, 2, Scalar(0, 255, 255), 2);
+        //   // cv::drawContours(out_color_img, contours_cur_cur, i, Scalar(0, 255, 0), 1, 8, hierarchy_cur_cur, 0, cv::Point());
+        //    Point2f rect_points[4];
+        //    minRect[i].points(rect_points);
+        //    Point shortest_half[4];
+       
+        //    for (int j = 0; j < 4; j++) {
+        //        shortest_half[j] = Point((rect_points[j].x + rect_points[(j + 1) % 4].x) / 2, (rect_points[j].y + rect_points[(j + 1) % 4].y) / 2);
+        //        //circle(out_color_img, shortest_half[j], 2, Scalar(255, 0, 255), 3, 8, 0);
+        //        line(out_color_img, rect_points[j], rect_points[(j + 1) % 4], Scalar(0, 255, 0), 2);
+
+        //    }
+        //    line(out_color_img, shortest_half[0], shortest_half[2], Scalar(0, 255, 255), 2);
+        //    line(out_color_img, shortest_half[1], shortest_half[3], Scalar(0, 255, 255), 2);
+
+        //    
+        //}
+
+        //cont_.push_back(contours_cur_cur[i]);
+    }
+
+   
+    for (int i = 1; i < contours_cur_cur.size(); i++) {
+        cv::Mat roi = cur_img(roiRects.at(i - 1));
+
+        double similarity = cv::matchShapes(pre_img, roi, CONTOURS_MATCH_I1, 0);
+
+        if (similarity < 0.1 * huMomentThres) {
+            cv::rectangle(matched_cont, roiRects.at(i - 1), cv::Scalar(0, 255, 0), 2);
+        }
+        //cout << "similarity=" << similarity << endl;
+    }
+    //imshow("matched_contour", matched_contour);
+
+    //------------------Hough Circles
+    //medianBlur(hog_cirlce, hog_cirlce, 3);
+    //vector<Vec3f> circles;
+    //HoughCircles(hog_cirlce, circles, HOUGH_GRADIENT, 1, hog_cirlce.rows / 16, 50, hog_a, hog_b, hog_c);
+
+    //for (size_t i = 0; i < circles.size(); i++)
+    //{
+    //    Point center(cvRound(circles[i][0]), cvRound(circles[i][1]));
+    //    int radius = cvRound(circles[i][2]);
+    //    circle(out_color_img, center, 3, Scalar(0, 255, 0), -1, 8, 0);// circle center     
+    //    circle(out_color_img, center, radius, Scalar(0, 0, 255), 3, 8, 0);// circle outline
+    //}
+    //------------------Hough Circles
+
+    return cont_;
+}
+
+void alignImages(Mat& im1, Mat& im2, Mat& im1Reg, Mat& h)
+{
+    // Convert images to grayscale
+    Mat im1Gray, im2Gray;
+    cvtColor(im1, im1Gray, cv::COLOR_BGR2GRAY);
+    cvtColor(im2, im2Gray, cv::COLOR_BGR2GRAY);
+
+    // Variables to store keypoints and descriptors
+    std::vector<KeyPoint> keypoints1, keypoints2;
+    Mat descriptors1, descriptors2;
+
+    // Detect ORB features and compute descriptors.
+    Ptr<Feature2D> orb = ORB::create(MAX_FEATURES);
+    orb->detectAndCompute(im1Gray, Mat(), keypoints1, descriptors1);
+    orb->detectAndCompute(im2Gray, Mat(), keypoints2, descriptors2);
+
+    // Match features.
+    std::vector<DMatch> matches;
+    Ptr<DescriptorMatcher> matcher = DescriptorMatcher::create("BruteForce-Hamming");
+    matcher->match(descriptors1, descriptors2, matches, Mat());
+
+    // Sort matches by score
+    std::sort(matches.begin(), matches.end());
+
+    // Remove not so good matches
+    const int numGoodMatches = matches.size() * GOOD_MATCH_PERCENT;
+    matches.erase(matches.begin() + numGoodMatches, matches.end());
+
+    // Draw top matches
+    Mat imMatches;
+    drawMatches(im1, keypoints1, im2, keypoints2, matches, imMatches);
+    //imwrite("matches.jpg", imMatches);
+    imshow("matched", imMatches);
+
+    // Extract location of good matches
+    std::vector<Point2f> points1, points2;
+
+    for (size_t i = 0; i < matches.size(); i++)
+    {
+        points1.push_back(keypoints1[matches[i].queryIdx].pt);
+        points2.push_back(keypoints2[matches[i].trainIdx].pt);
+    }
+
+    // Find homography
+    h = findHomography(points1, points2, RANSAC);
+
+    // Use homography to warp image
+    warpPerspective(im1, im1Reg, h, im2.size());
+}
+
+
+
+
+void ContourMatch(Mat pre_img, Mat cur_img)
+{
+
+    cv::Mat dst = pre_img.clone();
+
+
+    if (pre_img.channels() == 3) cvtColor(pre_img, pre_img, COLOR_BGR2GRAY);
+    if (cur_img.channels() == 3) cvtColor(cur_img, cur_img, COLOR_BGR2GRAY);
+
+
+    cv::Mat temp_bin, src_bin;
+    cv::threshold(pre_img, temp_bin, tempThres, 255, cv::THRESH_BINARY_INV);
+    cv::threshold(cur_img, src_bin, srcThres, 255, cv::THRESH_BINARY_INV);
+
+    cv::morphologyEx(temp_bin, temp_bin, cv::MORPH_OPEN, cv::Mat(), cv::Point(-1, -1), 2);
+    cv::morphologyEx(src_bin, src_bin, cv::MORPH_OPEN, cv::Mat(), cv::Point(-1, -1), 2);
+
+    cv::imshow("temp_bin", temp_bin);
+    cv::Mat labelsImg;
+    cv::Mat stats;
+    cv::Mat centroids;
+    int nLabels = cv::connectedComponentsWithStats(src_bin, labelsImg, stats, centroids);
+
+    cv::Mat roiImg;
+    cv::cvtColor(src_bin, roiImg, COLOR_GRAY2BGR);
+    std::vector<cv::Rect> roiRects;
+    for (int i = 1; i < nLabels; i++) {
+        int* param = stats.ptr<int>(i);
+
+        int x = param[cv::ConnectedComponentsTypes::CC_STAT_LEFT];
+        int y = param[cv::ConnectedComponentsTypes::CC_STAT_TOP];
+        int height = param[cv::ConnectedComponentsTypes::CC_STAT_HEIGHT];
+        int width = param[cv::ConnectedComponentsTypes::CC_STAT_WIDTH];
+        roiRects.push_back(cv::Rect(x, y, width, height));
+
+        cv::rectangle(roiImg, roiRects.at(i - 1), cv::Scalar(0, 255, 0), 2);
+    }
+    cv::imshow("roiImg", roiImg);
+
+    cout << "nLabels=" << nLabels << endl;
+
+    // huモーメントによる形状マッチングを行う
+    for (int i = 1; i < nLabels; i++) {
+        cv::Mat roi = src_bin(roiRects.at(i - 1));    // 対象とするブロブの領域取り出し
+        double similarity = cv::matchShapes(temp_bin, roi, CONTOURS_MATCH_I1, 0);    // huモーメントによるマッチング
+
+       // cout << "similarity="<< similarity << endl;
+
+        if (similarity < huMomentThres) {
+            cv::rectangle(dst, roiRects.at(i - 1), cv::Scalar(0, 255, 0), 2);
+        }
+    }
+
+    //  cv::imshow("template", temp);
+    cv::imshow("dst", dst);
+    // cv::imshow("dst", cur_img);
+    // cv::waitKey(1);
+
+     //cv::imwrite("dst.jpg", dst);
+
+}
+
+
+void track(Mat in_img, int thre, int area) {
+    int count = 0;
+    char a[40];
+    vector<vector<Point> > contours;
+    vector<Vec4i> hierarchy;
+    ////threshold(fgMaskMOG2, or2, thresh, maxVal, type);
+    ////GaussianBlur(fgMaskMOG2, fgMaskMOG2, Size(11, 11), 3.5, 3.5);
+    ////threshold(fgMaskMOG2, or2, 10, 255, THRESH_OTSU);
+    //GaussianBlur(fgMaskMOG2, fgMaskMOG2, Size(27, 27), 3.5, 3.5);
+    //threshold(fgMaskMOG2, fgMaskMOG2, thresh, maxVal, type); //THRESH_BINARY + THRESH_OTSU
+    ////Canny(or2, kenarlar, deger, deger * 2, 3);
+    //Canny(fgMaskMOG2, kenarlar, deger, deger * 2, 3); //OR2
+
+    Mat out_img;
+    in_img.copyTo(out_img);
+    cvtColor(in_img, in_img, COLOR_BGR2GRAY);
+
+    cv::threshold(in_img, in_img, thre, 255, THRESH_BINARY_INV);
+    findContours(in_img, contours, hierarchy, RETR_TREE, CHAIN_APPROX_SIMPLE, Point(0, 0)); //OR2
+    Mat cizim = Mat::zeros(in_img.size(), CV_8UC3); //kenarlar.size() or2.size()
+    if (contours.size() > 0) {
+        size_t indexOfBiggestContour = -1;
+        size_t sizeOfBiggestContour = 0;
+        for (size_t i = 0; i < contours.size(); i++) {
+            if (contours[i].size() > sizeOfBiggestContour) {
+                sizeOfBiggestContour = contours[i].size();
+                indexOfBiggestContour = i;
+            }
+        }
+        vector<vector<int> >hull(contours.size());
+        vector<vector<Point> >hullPoint(contours.size()); //elin hareketine göre eli çevreleyen çokgen	
+        vector<vector<Vec4i> > defects(contours.size()); //parmak uclarindaki yesil noktalar..multi dimensional matrix
+        vector<vector<Point> >defectPoint(contours.size()); //point olarak parmak ucu noktalarýný x,y olarak tutuyor
+        vector<vector<Point> >contours_poly(contours.size()); //eli çevreleyen hareketli dikdörtgen		
+        Point2f rect_point[4];
+        vector<RotatedRect>minRect(contours.size());
+        vector<Rect> boundRect(contours.size());
+        for (size_t i = 0; i < contours.size(); i++) {
+            if (contourArea(contours[i]) > area) {
+                convexHull(contours[i], hull[i], true);
+                convexityDefects(contours[i], hull[i], defects[i]);
+              //  if (indexOfBiggestContour == i) {
+                    minRect[i] = minAreaRect(contours[i]);
+                    for (size_t k = 0; k < hull[i].size(); k++) {
+                        int ind = hull[i][k];
+                        hullPoint[i].push_back(contours[i][ind]);
+                    }
+                    count = 0;
+
+                    for (size_t k = 0; k < defects[i].size(); k++) {
+                        if (defects[i][k][3] > 13 * 256) {
+                            int p_start = defects[i][k][0];
+                            int p_end = defects[i][k][1];
+                            int p_far = defects[i][k][2];
+                            defectPoint[i].push_back(contours[i][p_far]);
+                            circle(out_img, contours[i][p_start], 3, Scalar(0, 255, 0), 2); //i ydi
+                            circle(out_img, contours[i][p_far], 3, Scalar(0, 0, 255), 2); //i ydi
+                            circle(out_img, contours[i][p_end], 3, Scalar(255, 255, 0), 2); //i ydi
+
+                            count++;
+                        }
+
+                    }
+
+                    if (count == 1)
+                        strcpy_s(a, "1");
+                    else if (count == 2)
+                        strcpy_s(a, "2");
+                    else if (count == 3)
+                        strcpy_s(a, "3");
+                    else if (count == 4)
+                        strcpy_s(a, "4");
+                    else if (count == 5 || count == 6)
+                        strcpy_s(a, "5");
+                    else
+                        strcpy_s(a, "EL GOSTER");
+
+                   // putText(aynali, a, Point(75, 450), FONT_HERSHEY_SIMPLEX, 3, Scalar(0, 255, 0), 3, 8, false);
+
+                    drawContours(out_img, contours, i, Scalar(255, 255, 0), 2, 8, vector<Vec4i>(), 0, Point());
+                    drawContours(out_img, hullPoint, i, Scalar(255, 255, 0), 1, 8, vector<Vec4i>(), 0, Point());
+                    drawContours(out_img, hullPoint, i, Scalar(0, 0, 255), 2, 8, vector<Vec4i>(), 0, Point());
+                    approxPolyDP(contours[i], contours_poly[i], 3, false);
+                    boundRect[i] = boundingRect(contours_poly[i]);
+                    rectangle(out_img, boundRect[i].tl(), boundRect[i].br(), Scalar(255, 0, 0), 2, 8, 0);
+                    minRect[i].points(rect_point);
+                    for (size_t k = 0; k < 4; k++) {
+                        line(out_img, rect_point[k], rect_point[(k + 1) % 4], Scalar(0, 255, 0), 2, 8);
+                    }
+
+                }
+            }
+
+        //}
+
+    }
+
+
+    imshow("out_img", out_img);
+
+}
+
+void SingleParticle(Mat in_img, Mat out_img, int thre, int area, int frame) {
+   
+    vector<vector<Point> > contours;
+    vector<Vec4i> hierarchy;
+    int largest_area = 0, largest_contour_index = 0, count=0;
+       
+    cvtColor(in_img, in_img, COLOR_BGR2GRAY);
+
+    cv::threshold(in_img, in_img, thre, 255, THRESH_BINARY_INV);
+    findContours(in_img, contours, hierarchy, RETR_TREE, CHAIN_APPROX_SIMPLE, Point(0, 0)); 
+    for (int i = 0; i < contours.size(); ++i)
+    {
+        double a = contourArea(contours[i], false);  //Find the area of contour
+        if (a > largest_area) largest_area = a, largest_contour_index = i;
+    }
+    vector<vector<int> >hull(contours.size());
+    vector<vector<Point> >hull_points(contours.size());
+
+    vector<vector<Vec4i> > defects(contours.size());
+    Point2f rect_point[4];
+    vector<RotatedRect>minRect(contours.size());
+    vector<vector<Point> > contours_poly(contours.size());
+    vector<Rect> boundRect(contours.size());
+    if (contours.size() != 0) {
+        cv::drawContours(out_img, contours, largest_contour_index, Scalar(255, 255, 0), 1, 8, hierarchy, 0, cv::Point()); // get max area boundary
+        approxPolyDP(Mat(contours[largest_contour_index]), contours_poly[largest_contour_index], 3, true);
+        boundRect[largest_contour_index] = boundingRect(Mat(contours_poly[largest_contour_index]));
+        convexHull(contours[largest_contour_index], hull[largest_contour_index], true);
+        if(frame!=344 && frame != 459 && frame != 1053 && frame != 1101 && frame != 1103 && frame != 1201 && frame != 1695)convexityDefects(contours[largest_contour_index], hull[largest_contour_index], defects[largest_contour_index]);
+        cout << "frame=" << frame << "largest contour size=" << defects[largest_contour_index].size() << endl;
+        count = 0;
+        int last = defects[largest_contour_index].size();
+        for (size_t k = 0; k < defects[largest_contour_index].size(); k++) {
+                int p_start = defects[largest_contour_index][k][0];
+                int p_end = defects[largest_contour_index][k][1];
+                int p_far = defects[largest_contour_index][k][2];
+                int ini_p_far = defects[largest_contour_index][0][2];
+
+                    circle(out_img, contours[largest_contour_index][p_start], 3, Scalar(0, 255, 0), 2); //blue
+                    circle(out_img, contours[largest_contour_index][p_far], 3, Scalar(0, 0, 255), 2); //red
+                    circle(out_img, contours[largest_contour_index][p_end], 3, Scalar(255, 0, 0), 2); //green
+                    // cv::line(out_img, Point(contours[largest_contour_index][pre_p_far].x, contours[largest_contour_index][pre_p_far].y), Point(contours[largest_contour_index][p_far].x, contours[largest_contour_index][p_far].y), CV_RGB(255, 255, 0), 2);
+                  
+                     if (k > 0) {
+                     int pre_p_far = defects[largest_contour_index][k - 1][2];
+
+                    cv::line(out_img, contours[largest_contour_index][pre_p_far], contours[largest_contour_index][p_far], CV_RGB(255, 255, 0), 2);
+                    if (k == last-1) cv::line(out_img, contours[largest_contour_index][ini_p_far], contours[largest_contour_index][p_far], CV_RGB(255, 255, 0), 2);
+                }
+                count++;
+        }
+     }
+        
+   }
+        
+void MultiParticle(Mat in_img, Mat out_img, int thre, int area, int frame) {
+
+    vector<vector<Point> > contours;
+    vector<Vec4i> hierarchy;
+    int largest_area = 0, largest_contour_index = 0, count = 0;
+
+    cvtColor(in_img, in_img, COLOR_BGR2GRAY);
+
+    cv::threshold(in_img, in_img, thre, 255, THRESH_BINARY_INV);
+    findContours(in_img, contours, hierarchy, RETR_TREE, CHAIN_APPROX_SIMPLE, Point(0, 0));
+    for (int i = 0; i < contours.size(); ++i)
+    {
+        double a = contourArea(contours[i], false);  //Find the area of contour
+        if (a > largest_area) largest_area = a, largest_contour_index = i;
+    }
+    vector<vector<int> >hull(contours.size());
+    vector<vector<Point> >hull_points(contours.size());
+
+    vector<vector<Vec4i> > defects(contours.size());
+    Point2f rect_point[4];
+    vector<RotatedRect>minRect(contours.size());
+    vector<vector<Point> > contours_poly(contours.size());
+    vector<Rect> boundRect(contours.size());
+    if (contours.size() != 0) {
+        vector<Point> intersectedValues;
+        intersectedValues = contours[0];
+        for (int i = 1; i < contours.size(); ++i) {
+
+            cv::drawContours(out_img, contours, i, Scalar(255, 255, 0), 1, 8, hierarchy, 0, cv::Point()); // get max area boundary
+            approxPolyDP(Mat(contours[i]), contours_poly[i], 3, true);
+            boundRect[i] = boundingRect(Mat(contours_poly[i]));
+            convexHull(contours[i], hull[i], true);
+            //cout << "frame=" << frame << endl;
+
+            vector<unsigned> tempIntersectedSubjects;
+            tempIntersectedSubjects.reserve(intersectedValues.size()); // pre-allocate
+
+            if (frame != 344 && frame != 459 && frame != 1053 && frame != 1101 && frame != 1103 && frame != 1201 && frame != 1695)convexityDefects(contours[largest_contour_index], hull[largest_contour_index], defects[largest_contour_index]);
+            cout << "frame=" << frame << "largest contour size=" << defects[largest_contour_index].size() << endl;
+            count = 0;
+            for (size_t k = 0; k < defects[largest_contour_index].size(); k++) {
+                int p_start = defects[largest_contour_index][k][0];
+                int p_end = defects[largest_contour_index][k][1];
+                int p_far = defects[largest_contour_index][k][2];
+               // circle(out_img, contours[largest_contour_index][p_start], 3, Scalar(0, 255, 0), 2); //blue
+                circle(out_img, contours[largest_contour_index][p_far], 3, Scalar(0, 0, 255), 2); //red
+                //circle(out_img, contours[largest_contour_index][p_end], 3, Scalar(255, 0, 0), 2); //green
+
+
+                count++;
+            }
+        }
+    }
+
+}
+
+
+
+

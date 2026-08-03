@@ -1,0 +1,8 @@
+path: C:\Users\himan\Downloads\Spray\yolo_dataset
+train: train/images
+val: val/images
+test: test/images
+nc: 2
+names:
+- droplet
+- ligament
