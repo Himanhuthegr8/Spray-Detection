@@ -80,6 +80,7 @@ def analyze_frame_with_rejections(
     # ===== Branch A =====
     binary, denoised = sp.extract_foreground(frame, background, args)
     binary_clean = sp.clean_mask(binary, args)
+    binary_clean = sp.split_touching_components(binary_clean, args)
     components = sp.find_component_contours(binary_clean)
 
     branch_a_mask = np.zeros((img_h, img_w), dtype=np.uint8)

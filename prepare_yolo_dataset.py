@@ -33,6 +33,8 @@ Output:
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
+import math
 import random
 import shutil
 import sys
@@ -76,6 +78,81 @@ TEST_RATIO  = 0.10
 
 MIN_POLYGON_POINTS = 3
 MIN_AREA_PIXELS = 3  # fixed: was 5, must align with spray_physics min_area=2
+
+
+@dataclass
+class FineTrack:
+    centroid: tuple[float, float]
+    last_frame: int
+    hits: int = 1
+    moving_hits: int = 0
+    missed: int = 0
+
+
+class FineDropletTracker:
+    """Confirm tiny LoG candidates through short, non-static tracks."""
+
+    def __init__(self, max_distance: float, min_displacement: float, min_hits: int, max_age: int):
+        self.max_distance = max_distance
+        self.min_displacement = min_displacement
+        self.min_hits = min_hits
+        self.max_age = max_age
+        self.tracks: dict[int, FineTrack] = {}
+        self.next_track_id = 1
+
+    @staticmethod
+    def _centroid(contour: np.ndarray) -> tuple[float, float]:
+        moments = cv2.moments(contour)
+        if moments["m00"]:
+            return moments["m10"] / moments["m00"], moments["m01"] / moments["m00"]
+        x, y, width, height = cv2.boundingRect(contour)
+        return x + width / 2.0, y + height / 2.0
+
+    def update(self, contours: list[np.ndarray], frame_id: int) -> list[bool]:
+        centres = [self._centroid(contour) for contour in contours]
+        candidates: list[tuple[float, int, int]] = []
+        for contour_idx, centre in enumerate(centres):
+            for track_id, track in self.tracks.items():
+                distance = math.dist(centre, track.centroid)
+                if distance <= self.max_distance:
+                    candidates.append((distance, contour_idx, track_id))
+        candidates.sort()
+
+        assignments: dict[int, int] = {}
+        used_contours: set[int] = set()
+        used_tracks: set[int] = set()
+        for _, contour_idx, track_id in candidates:
+            if contour_idx not in used_contours and track_id not in used_tracks:
+                assignments[contour_idx] = track_id
+                used_contours.add(contour_idx)
+                used_tracks.add(track_id)
+
+        confirmed: list[bool] = []
+        for contour_idx, centre in enumerate(centres):
+            track_id = assignments.get(contour_idx)
+            if track_id is None:
+                self.tracks[self.next_track_id] = FineTrack(centre, frame_id)
+                self.next_track_id += 1
+                confirmed.append(False)
+                continue
+
+            track = self.tracks[track_id]
+            displacement = math.dist(centre, track.centroid)
+            track.centroid = centre
+            track.last_frame = frame_id
+            track.hits += 1
+            track.missed = 0
+            if displacement >= self.min_displacement:
+                track.moving_hits += 1
+            confirmed.append(track.hits >= self.min_hits and track.moving_hits > 0)
+
+        for track_id, track in list(self.tracks.items()):
+            if track.last_frame != frame_id:
+                track.missed += 1
+                if track.missed > self.max_age:
+                    del self.tracks[track_id]
+
+        return confirmed
 
 
 def contour_to_yolo_polygon(
@@ -140,6 +217,7 @@ def process_frame_physics(
     frame_id: int,
     background: sp.BackgroundModel | None,
     args: argparse.Namespace,
+    fine_tracker: FineDropletTracker | None = None,
 ) -> list[str]:
     """Segment a single frame using the dual-branch PHYSICS pipeline.
 
@@ -156,6 +234,7 @@ def process_frame_physics(
     # ===== Branch A: contour pipeline =====
     binary, denoised = sp.extract_foreground(frame, background, args)
     binary = sp.clean_mask(binary, args)
+    binary = sp.split_touching_components(binary, args)
     components = sp.find_component_contours(binary)
 
     lines: list[str] = []
@@ -196,10 +275,19 @@ def process_frame_physics(
     # ===== Branch B: LoG fine-droplet detection =====
     # Use raw grayscale (not denoised) — preserves tiny blobs
     raw_gray = sp.to_gray(frame)
-    fine_blobs = sp.detect_fine_droplets(raw_gray, background, args, branch_a_mask)
+    fine_blobs = [
+        (contour, area)
+        for contour, area in sp.detect_fine_droplets(raw_gray, background, args, branch_a_mask)
+        if area >= MIN_AREA_PIXELS
+    ]
+    confirmed = (
+        fine_tracker.update([contour for contour, _ in fine_blobs], frame_id)
+        if fine_tracker is not None
+        else [True] * len(fine_blobs)
+    )
 
-    for blob_contour, blob_area in fine_blobs:
-        if blob_area < MIN_AREA_PIXELS:
+    for (blob_contour, blob_area), is_confirmed in zip(fine_blobs, confirmed):
+        if not is_confirmed:
             continue
 
         # All LoG blobs are classified as droplets
@@ -256,6 +344,14 @@ def main() -> None:
     )
     parser.add_argument("--dataset", default="dataset", help="Input frames directory.")
     parser.add_argument("--output", default="yolo_dataset", help="Output dataset directory.")
+    parser.add_argument("--fine-track-distance", type=float, default=12.0,
+                        help="Maximum fine-droplet displacement between adjacent frames.")
+    parser.add_argument("--fine-track-min-displacement", type=float, default=0.5,
+                        help="Minimum movement needed to reject static fine candidates.")
+    parser.add_argument("--fine-track-min-hits", type=int, default=2,
+                        help="Observations required before exporting a fine-droplet mask.")
+    parser.add_argument("--fine-track-max-age", type=int, default=1,
+                        help="Missed frames retained for a fine-droplet track.")
     cli_args = parser.parse_args()
 
     dataset_dir = Path(cli_args.dataset)
@@ -294,7 +390,8 @@ def main() -> None:
         print(f"\n  Branch A: hysteresis z-score [{args.background_zscore_lo}, {args.background_zscore_hi}]")
         print(f"            morph-close={args.morph_close_ksize}, edge-strength>={args.min_edge_strength}")
         print(f"  Branch B: LoG blobs sigma=[{args.log_sigma_min}, {args.log_sigma_max}], threshold={args.log_threshold}")
-        print(f"  Main jet: boundary-margin={args.boundary_margin}px, boundary-min-area={args.boundary_min_area}px")
+        print(f"  Main jet: left source ROI={args.source_roi_width_fraction:.0%}, min-area={args.source_min_area}px")
+        print("  Watershed: enabled for compact multi-peak components")
         print(f"  Export:   MIN_AREA_PIXELS={MIN_AREA_PIXELS}")
 
     # Shuffle and split
@@ -323,12 +420,25 @@ def main() -> None:
 
     # Process every frame
     stats = {"total_objects": 0, "droplets": 0, "ligaments": 0, "frames_processed": 0}
+    fine_tracker = (
+        FineDropletTracker(
+            cli_args.fine_track_distance,
+            cli_args.fine_track_min_displacement,
+            cli_args.fine_track_min_hits,
+            cli_args.fine_track_max_age,
+        )
+        if use_physics
+        else None
+    )
 
     for idx, frame_path in enumerate(frame_paths):
         frame_id = sp.frame_number(frame_path)
         split = split_map[idx]
 
-        label_lines = process_fn(frame_path, frame_id, background, args)
+        if use_physics:
+            label_lines = process_frame_physics(frame_path, frame_id, background, args, fine_tracker)
+        else:
+            label_lines = process_fn(frame_path, frame_id, background, args)
 
         for line in label_lines:
             cls = int(line.split()[0])

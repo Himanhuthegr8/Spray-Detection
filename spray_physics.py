@@ -325,7 +325,7 @@ def is_source_contour(
     roi_width_fraction: float = DEFAULT_SOURCE_ROI_WIDTH_FRACTION,
     min_area: int = DEFAULT_SOURCE_MIN_AREA,
 ) -> bool:
-    """True if this contour touches the SOURCE side of the image.
+    """Return True when a large contour intersects the left-side source ROI.
 
     The nozzle is on the LEFT (and sometimes TOP) of the frame.
     Only contours touching those edges are the main jet/sheet.
@@ -423,7 +423,8 @@ def split_touching_components(binary: np.ndarray, args: argparse.Namespace) -> n
             markers[peak_labels == peak_label] = peak_label + 1
         markers = cv2.watershed(watershed_image, markers)
         split_crop = markers > 1
-        split[y0:y1, x0:x1][split_crop] = 255
+        target = split[y0:y1, x0:x1]
+        target[split_crop] = 255
 
     return split
 
@@ -968,22 +969,18 @@ def draw_detections(
     if fill_main:
         fill_mask = np.zeros(frame.shape[:2], np.uint8)
         for det, cnt in tracked_with_contours:
-            if det.label == "main_ligament":
+            if det.label == "main_jet":
                 cv2.drawContours(fill_mask, [cnt], -1, 255, thickness=cv2.FILLED)
         if fill_mask.any():
             colored = np.zeros_like(frame)
-            colored[:] = COLORS["main_ligament"]
+            colored[:] = COLORS["main_jet"]
             blended = cv2.addWeighted(frame, 0.65, colored, 0.35, 0)
             output[fill_mask == 255] = blended[fill_mask == 255]
 
     for det, cnt in tracked_with_contours:
         color = COLORS.get(det.label, COLORS["uncertain"])
-        thickness = 2 if det.label != "main_ligament" else 1
+        thickness = 2 if det.label != "main_jet" else 1
         cv2.drawContours(output, [cnt], -1, color, thickness)
-        if det.label in ("ligament", "droplet"):
-            box = cv2.boxPoints(cv2.minAreaRect(cnt))
-            box = np.intp(box)
-            cv2.polylines(output, [box], True, color, 1)
     return output
 
 
@@ -1006,7 +1003,7 @@ def debug_mosaic(frame: np.ndarray, binary: np.ndarray, annotated: np.ndarray) -
 def build_frame_summary(frame_id: int, detections: list[Detection]) -> FrameSummary:
     droplets = [d for d in detections if d.label == "droplet"]
     ligaments = [d for d in detections if d.label == "ligament"]
-    mains = [d for d in detections if d.label == "main_ligament"]
+    mains = [d for d in detections if d.label == "main_jet"]
     uncertain = [d for d in detections if d.label == "uncertain"]
     return FrameSummary(
         frame=frame_id,
@@ -1171,4 +1168,93 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--background-frames", type=int, default=80)
     p.add_argument("--background-percentile", type=float, default=99.0)
     p.add_argument("--background-noise-floor", type=float, default=4.0)
-    p.add_
+    p.add_argument("--background-align-percentile", type=float, default=90.0)
+    p.add_argument("--background-max-shift", type=int, default=25)
+    p.add_argument("--background-zscore", type=float, default=1.5,
+                    help="(Deprecated, use --background-zscore-lo) Alias for z_lo.")
+    p.add_argument("--background-zscore-hi", type=float, default=3.0,
+                    help="Strong z-score threshold (seeds). Higher = stricter.")
+    p.add_argument("--background-zscore-lo", type=float, default=1.5,
+                    help="Weak z-score threshold (growth). Lower = captures fainter edges.")
+    p.add_argument("--min-foreground-contrast", type=int, default=4,
+                    help="Minimum absolute BG-FG intensity difference.")
+
+    # Preprocessing
+    p.add_argument("--denoise", choices=("median", "bilateral", "none"), default="median")
+    p.add_argument("--median-ksize", type=int, default=3)
+    p.add_argument("--morph-open-ksize", type=int, default=1,
+                    help="Opening kernel size. Removes tiny noise specks.")
+    p.add_argument("--morph-close-ksize", type=int, default=1,
+                    help="Closing kernel size. Bridges small gaps.")
+
+    # Quality gates
+    p.add_argument("--min-edge-strength", type=float, default=3.0,
+                    help="Minimum mean Sobel gradient along the contour. Rejects soft-gradient false contours.")
+    p.add_argument("--min-interior-ratio", type=float, default=0.05,
+                    help="Minimum fraction of interior pixels darker than background. Rejects transparent/noise contours.")
+
+    # Classification
+    p.add_argument("--min-area", type=float, default=2.0)
+    p.add_argument("--area", type=int, default=DEFAULT_MAIN_AREA)
+    p.add_argument("--source-roi-width-fraction", type=float, default=DEFAULT_SOURCE_ROI_WIDTH_FRACTION,
+                    help="Width of the left-side source ROI as a fraction of the frame width.")
+    p.add_argument("--source-min-area", type=int, default=DEFAULT_SOURCE_MIN_AREA,
+                    help="Min area (px) for a source-ROI contour to be classified as main jet.")
+    p.add_argument("--small-droplet-max-pixels", type=int, default=DEFAULT_SMALL_DROPLET_MAX_PIXELS)
+    p.add_argument("--small-droplet-max-aspect", type=float, default=2.5)
+    p.add_argument("--droplet-min-circularity", type=float, default=DEFAULT_DROPLET_MIN_CIRCULARITY)
+    p.add_argument("--droplet-min-solidity", type=float, default=DEFAULT_DROPLET_MIN_SOLIDITY)
+    p.add_argument("--droplet-max-aspect", type=float, default=DEFAULT_DROPLET_MAX_ASPECT)
+    p.add_argument("--ligament-min-aspect", type=float, default=DEFAULT_LIGAMENT_MIN_ASPECT)
+    p.add_argument("--ligament-max-circularity", type=float, default=DEFAULT_LIGAMENT_MAX_CIRCULARITY)
+    p.add_argument("--ligament-min-defects", type=int, default=DEFAULT_LIGAMENT_MIN_DEFECTS)
+
+    # Branch B: LoG fine-droplet detector
+    p.add_argument("--enable-log-blobs", action="store_true", default=True,
+                    help="Enable LoG blob detector for fine droplets (Branch B).")
+    p.add_argument("--log-sigma-min", type=float, default=1.0,
+                    help="Smallest LoG sigma (detects ~2px blobs).")
+    p.add_argument("--log-sigma-max", type=float, default=4.0,
+                    help="Largest LoG sigma (detects ~12px blobs).")
+    p.add_argument("--log-num-scales", type=int, default=5,
+                    help="Number of LoG scales between sigma-min and sigma-max.")
+    p.add_argument("--log-threshold", type=float, default=0.20,
+                    help="Minimum noise-normalised LoG response to accept a blob.")
+    p.add_argument("--log-max-radius", type=float, default=15.0,
+                    help="Maximum blob radius in pixels.")
+    p.add_argument("--log-min-center-z", type=float, default=1.0,
+                    help="Minimum background-noise-normalised darkness at a blob centre.")
+    p.add_argument("--log-min-center-delta-z", type=float, default=0.5,
+                    help="Minimum centre-to-annulus darkness difference in local noise units.")
+
+    # Split compact, multi-peak droplet clusters without fragmenting ligaments.
+    p.add_argument("--disable-watershed", action="store_false", dest="enable_watershed",
+                    help="Disable watershed splitting for touching compact droplets.")
+    p.set_defaults(enable_watershed=True)
+    p.add_argument("--watershed-min-component-area", type=int, default=20)
+    p.add_argument("--watershed-max-component-area", type=int, default=2000)
+    p.add_argument("--watershed-max-aspect", type=float, default=2.5)
+    p.add_argument("--watershed-min-peak-distance", type=int, default=3)
+    p.add_argument("--watershed-min-peak-height", type=float, default=1.2)
+    p.add_argument("--watershed-peak-height-fraction", type=float, default=0.45)
+
+    # Tracking
+    p.add_argument("--max-track-distance", type=float, default=40.0)
+    p.add_argument("--track-max-age", type=int, default=5)
+    p.add_argument("--classify-smooth-window", type=int, default=5,
+                    help="Frames of label history for majority-vote smoothing.")
+    p.add_argument("--min-small-droplet-speed", type=float, default=0.5)
+    p.add_argument("--min-track-hits", type=int, default=2)
+    p.add_argument("--draw-tentative", action="store_true")
+    p.add_argument("--fill-main-ligament", action="store_true")
+
+    return p
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    process_frames(args)
+
+
+if __name__ == "__main__":
+    main()
