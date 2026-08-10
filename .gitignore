@@ -1,0 +1,46 @@
+# ============================================================
+# Spray Detection Project — .gitignore
+# ============================================================
+
+# --- Generated datasets (can be recreated by running prepare_yolo_dataset.py) ---
+yolo_dataset/
+yolo_dataset_test/
+yolo_dataset_v2/
+yolo_dataset_v3/
+
+# --- Training results and model weights (too large for GitHub) ---
+runs/
+
+# --- Raw video and large binary files ---
+Drop.avi
+annotated_spray.avi
+*.avi
+*.mp4
+
+# --- Raw frame dataset (2000 PNGs, ~500MB) ---
+dataset/
+
+# --- Preview outputs ---
+physics_label_preview_5/
+annotated_frames/
+All_Images/
+
+# --- Pre-trained YOLO base weights (downloaded automatically by ultralytics) ---
+yolov8n-seg.pt
+yolov8s-seg.pt
+yolo26n.pt
+*.pt
+
+# --- Python cache ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# --- Evaluation outputs ---
+evaluation_results/
+
+# --- IDE / OS junk ---
+.vscode/
+*.DS_Store
+Thumbs.db

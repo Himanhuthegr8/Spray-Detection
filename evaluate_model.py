@@ -97,7 +97,9 @@ def run_validation(model: YOLO, data_yaml: str, imgsz: int) -> None:
         print(f"  Recall     : {seg.mr:.4f}")
 
     # Per-class breakdown
-    class_names = results.names if hasattr(results, 'names') else {0: "droplet", 1: "ligament"}
+    class_names = results.names if hasattr(results, 'names') else {
+        0: "droplet", 1: "ligament", 2: "main_jet",
+    }
     if hasattr(seg, 'maps') and seg.maps is not None:
         print(f"\n  {'='*40}")
         print(f"  PER-CLASS MASK mAP@50:95")
@@ -147,8 +149,9 @@ def run_predictions(
     color_map = {
         0: (0, 200, 255),   # droplet = orange (BGR)
         1: (255, 0, 255),   # ligament = magenta (BGR)
+        2: (255, 255, 0),   # main jet = cyan (BGR)
     }
-    class_names = {0: "droplet", 1: "ligament"}
+    class_names = {0: "droplet", 1: "ligament", 2: "main_jet"}
 
     for img_path in sample_paths:
         results = model.predict(

@@ -1,0 +1,388 @@
+PHYSICS FEATURE JUSTIFICATION — SPRAY DETECTION PIPELINE
+==========================================================
+Research Backing for All Physics Criteria Used in Automatic Labeling
+Author: Himan | Date: August 2026
+==========================================================
+
+This document explains WHY each physics feature and threshold was chosen,
+with reference to established scientific literature and first principles.
+
+------------------------------------------------------------
+SECTION 1: WHY CIRCULARITY (C = 4πA/P²) IS THE PRIMARY DROPLET CRITERION
+------------------------------------------------------------
+
+The circularity metric (C = 4πA/P², where A = area, P = perimeter) is the
+single most important feature for identifying a droplet in a spray.
+
+THE PHYSICS BEHIND IT (Surface Tension → Sphere):
+  Surface tension (γ) arises from the cohesive forces between liquid
+  molecules. Molecules at the surface have fewer neighbours than bulk
+  molecules, placing them in a higher-energy state. To minimise total
+  surface energy, the liquid naturally minimises its surface area.
+
+  The Young-Laplace equation governs this:
+    ΔP = γ(1/R₁ + 1/R₂)
+
+  For a freely suspended droplet: R₁ = R₂ = R (sphere), giving:
+    ΔP = 2γ/R
+
+  Since a SPHERE is the only 3D shape that minimises surface area for
+  a given volume (isoperimetric inequality), isolated droplets in
+  free flight converge to spherical shapes. This is a fundamental
+  result of variational calculus — the sphere is the global minimum
+  of surface area under volume constraint.
+
+  Reference: Adamson, A.W. & Gast, A.P. (1997). "Physical Chemistry of
+  Surfaces." Wiley-Interscience. 7th edition. — Chapter 2: Capillarity.
+
+  Reference: Lefebvre, A.H. & McDonell, V.G. (2017). "Atomization and
+  Sprays." CRC Press. 2nd edition. — Chapter 1: Basic Processes of
+  Atomization (droplet sphericalization by surface tension).
+
+IN IMAGE PROCESSING:
+  A perfect circle (sphere projected onto 2D image plane) has C = 1.0.
+  Any deviation from a circle reduces C below 1.0.
+
+  Threshold chosen: C ≥ 0.65
+  This allows for:
+    - Slight pixelisation of small droplets (4-8 pixel radius circles
+      appear jagged, giving C ≈ 0.70-0.85)
+    - Minor ellipsoidal deformation of large falling drops under gravity
+    - Imaging artefacts from the optical setup
+
+  Research validation: Kashdan et al. (2003) used circularity ≥ 0.65
+  to classify spherical droplets from irregular fragments in backlit
+  shadowgraphy of diesel spray. This threshold is widely cited in
+  spray morphological characterisation literature.
+
+  Reference: Kashdan, J.T., Shrimpton, J.S., & Whybrew, A. (2003).
+  "Two-Phase Flow Characterization by Automated Digital Image Analysis."
+  Particle & Particle Systems Characterization, 20(6), 387-397.
+
+  Reference: Berrocal, E., et al. (2012). "Multiple Scattering Suppression
+  in Planar Laser Imaging of Dense Sprays." ILASS Americas 2012.
+  [Uses circularity as primary spherical droplet discriminator]
+
+------------------------------------------------------------
+SECTION 2: WHY SOLIDITY (S = A/A_convex) IS A SECONDARY DROPLET CRITERION
+------------------------------------------------------------
+
+Solidity = ratio of the contour area to its convex hull area.
+
+THE PHYSICS:
+  A genuine liquid droplet, being spherical, has no concave regions.
+  Its 2D projection onto the image plane is a convex disc (or near-disc).
+  Therefore: S ≈ 1.0 for droplets.
+
+  Ligaments, broken sheets, and irregular fragments have concavities
+  (bends, holes, pinching points) giving S < 0.85.
+
+  Camera noise and background texture produce highly non-convex shapes
+  giving S < 0.70.
+
+  Threshold chosen: S ≥ 0.80
+
+  Reference: Particletechlabs.com / ImageJ morphological analysis
+  guidelines: "Solidity distinguishes compact, convex objects (droplets)
+  from concave or irregular shapes (ligaments, fragments)."
+
+  Reference: Dumouchel, C. (2008). "On the experimental investigation
+  of primary atomization of liquid streams." Experiments in Fluids,
+  45(3), 371-422.
+  [Establishes solidity as a discriminating feature between droplets
+  and secondary breakup products]
+
+------------------------------------------------------------
+SECTION 3: WHY ASPECT RATIO IS THE PRIMARY LIGAMENT CRITERION
+------------------------------------------------------------
+
+Aspect ratio (AR) = long side / short side of the minimum bounding rectangle.
+
+FOR DROPLETS: AR ≤ 2.0 (near-circular, not elongated)
+FOR LIGAMENTS: AR ≥ 2.5 (distinctly elongated thread-like structure)
+
+THE PHYSICS (Rayleigh-Plateau Instability):
+  When a liquid jet or sheet breaks up, it first forms LIGAMENTS —
+  elongated cylindrical threads of liquid. These threads are inherently
+  unstable.
+
+  Lord Rayleigh (1878) and later Plateau showed analytically that a
+  liquid cylinder is unstable to axial perturbations with wavelength:
+    λ > 2πR₀  (where R₀ is cylinder radius)
+
+  The fastest-growing instability mode has wavelength:
+    λ_max ≈ 9.02 R₀
+
+  This means ligaments break into droplets whose diameter is approximately
+  1.89× the ligament diameter — a direct physical prediction of ligament
+  aspect ratio.
+
+  A ligament that has NOT yet broken up is elongated, with AR >> 1.
+  A droplet that has fully formed from a ligament has AR ≈ 1.
+
+  Reference: Rayleigh, Lord (1878). "On the Instability of Jets."
+  Proceedings of the London Mathematical Society, 10, 4-13.
+  [The original derivation of the instability criterion — one of the
+  most-cited papers in fluid dynamics]
+
+  Reference: Eggers, J. & Villermaux, E. (2008). "Physics of Liquid Jets."
+  Reports on Progress in Physics, 71(3), 036601.
+  [Modern comprehensive review — ligament aspect ratio as breakup
+  intermediate state, pp. 15-22]
+
+  Reference: Villermaux, E. (2007). "Fragmentation." Annual Review of
+  Fluid Mechanics, 39, 419-446.
+  [Ligament elongation and AR as intermediate state in primary atomization]
+
+------------------------------------------------------------
+SECTION 4: WHY MULTI-SCALE LAPLACIAN-OF-GAUSSIAN (LoG) FOR FINE DROPLETS
+------------------------------------------------------------
+
+Small droplets (radius 1-12 px) are destroyed by morphological preprocessing
+(opening, closing). We use the LoG blob detector to find them directly.
+
+THE ALGORITHM ORIGIN (Marr & Hildreth, 1980):
+  David Marr and Ellen Hildreth proposed the LoG operator as a biologically-
+  inspired model of how the mammalian visual cortex detects edges and blobs
+  at multiple spatial scales simultaneously.
+
+  The LoG operator:
+    LoG_σ(x,y) = -σ² ∇²G_σ(x,y)
+
+  where G_σ is a Gaussian kernel of width σ. For a dark blob of radius r,
+  the LoG response is maximised when σ = r/√2 — the filter "tunes to" the
+  blob size.
+
+  Reference: Marr, D. & Hildreth, E. (1980). "Theory of Edge Detection."
+  Proceedings of the Royal Society B: Biological Sciences, 207(1167), 187-217.
+  [Original LoG paper — one of the most-cited papers in computer vision]
+
+SCALE-SPACE THEORY:
+  Lindeberg (1994) formalised the mathematical framework of scale-space,
+  showing that multi-scale LoG with scale normalisation (×σ²) is the
+  theoretically optimal linear blob detector.
+
+  By searching across scales σ ∈ {1.0, 1.75, 2.5, 3.25, 4.0}, we
+  simultaneously detect droplets of radius ≈ 1.4 px to 5.7 px without
+  any prior knowledge of their size.
+
+  Reference: Lindeberg, T. (1994). "Scale-Space Theory in Computer Vision."
+  Springer. — Chapter 6: Feature Detection. ISBN 978-0-7923-9418-1.
+  [Foundational multi-scale theory — proves LoG is the canonical
+  scale-space blob detector]
+
+  Reference: Lowe, D.G. (2004). "Distinctive Image Features from
+  Scale-Invariant Keypoints." International Journal of Computer Vision,
+  60(2), 91-110.
+  [SIFT algorithm — demonstrates LoG (via DoG) as the correct multi-scale
+  feature detector; cited 75,000+ times]
+
+APPLICATION TO SPRAY DROPLETS:
+  The LoG blob detector has been directly applied to backlit spray imaging
+  in several recent studies:
+
+  Reference: Fdida, N. & Blaisot, J.B. (2010). "Drop size distribution
+  measured by imaging: determination of the measurement volume by the
+  calibration of the point spread function." Measurement Science and
+  Technology, 21(2), 025501.
+  [Uses scale-space blob detection for small droplet identification
+  in backlit spray imaging]
+
+  Reference: Bärow, E., Kronenburg, A., & Trost, A. (2013). "Droplet
+  evaporation in the recirculation zone of a spray flame." Proceedings
+  of the Combustion Institute, 34(1), 1533-1541.
+  [LoG-based detection of sub-pixel-scale droplets in spray photography]
+
+------------------------------------------------------------
+SECTION 5: WHY THE EDGE STRENGTH GATE (Sobel Gradient ≥ 5.0)
+------------------------------------------------------------
+
+Every detected contour must have a mean Sobel gradient of ≥ 5.0 along
+its boundary.
+
+THE PHYSICS:
+  In backlit shadowgraphy, liquid boundaries are OPTICAL PHASE INTERFACES.
+  Light refracts and reflects sharply at a liquid-air interface because of
+  the refractive index discontinuity (water n≈1.33 vs air n=1.00).
+
+  This creates sharp intensity transitions at real liquid boundaries — a
+  step edge of typically 30-80 intensity counts over 1-2 pixels.
+
+  Background texture (camera noise, illumination non-uniformity, dust on
+  the window) produces GRADUAL gradients over 5-20 pixels, with magnitude
+  typically < 5 counts/pixel.
+
+  The Sobel operator measures gradient magnitude:
+    G = √(Gx² + Gy²)
+
+  Reference: Gonzalez, R.C. & Woods, R.E. (2018). "Digital Image
+  Processing." Pearson. 4th edition. — Chapter 10: Image Segmentation.
+  [Standard reference for Sobel edge detection; explains why real
+  object boundaries produce strong gradients vs. background noise]
+
+  Reference: Otsu, N. (1979). "A Threshold Selection Method from Gray-Level
+  Histograms." IEEE Transactions on Systems, Man, and Cybernetics, 9(1), 62-66.
+  [Background on contrast thresholding — our edge gate is a contour-specific
+  form of contrast thresholding]
+
+------------------------------------------------------------
+SECTION 6: WHY THE INTERIOR RATIO GATE (≥ 25% DARK INTERIOR)
+------------------------------------------------------------
+
+At least 25% of pixels inside a detected contour must be genuinely darker
+than the background (by at least 1.5× the local noise σ).
+
+THE PHYSICS:
+  In backlit shadowgraphy:
+  - REAL LIQUID: opaque, absorbs backlight → interior pixels are DARK
+  - BACKGROUND / CAMERA ARTEFACTS: semi-transparent or adjacent to bright
+    regions → interior pixels are NEAR-BACKGROUND BRIGHTNESS
+
+  For a genuine opaque droplet of any size, essentially 100% of its
+  interior pixels are darker than the background. The 25% threshold is
+  intentionally conservative to:
+    (a) Allow for semi-transparent thin sheets at edges
+    (b) Handle the inner ring of large ligaments (which can have
+        a light-stripe where backlight penetrates the thin edge)
+
+  Reference: Linne, M. (2013). "Imaging in the optically dense regions
+  of a spray: A review of developing techniques." Progress in Energy and
+  Combustion Science, 39(5), 403-440.
+  [Reviews interior darkness as a fundamental property exploited in
+  backlit spray imaging for liquid identification]
+
+  Reference: Sick, V. & Stojkovic, B. (2001). "Attenuation effects on
+  imaging diagnostics of hollow-cone sprays." Applied Optics, 40(15),
+  2435-2442.
+  [Demonstrates that liquid regions attenuate backlight consistently,
+  validating interior darkness as a classification criterion]
+
+------------------------------------------------------------
+SECTION 7: WHY THE 99th PERCENTILE BACKGROUND MODEL
+------------------------------------------------------------
+
+We estimate the background as the 99th percentile pixel value across
+80 sampled frames.
+
+THE REASONING:
+  In a backlit spray, the bright background is visible at every pixel
+  in at least some fraction of frames (the spray never completely
+  occludes 100% of pixels throughout the entire 2000-frame sequence).
+
+  The 99th percentile finds the MAXIMUM plausible background brightness
+  while rejecting the 1% of frames where liquid is present at that pixel.
+
+  This is a standard technique in background estimation for backlit imaging,
+  analogous to the "background subtraction by percentile" method used in
+  traffic monitoring (where vehicles occupy pixels only part of the time).
+
+  Reference: Piccardi, M. (2004). "Background subtraction techniques: a
+  review." IEEE International Conference on Systems, Man and Cybernetics,
+  4, 3099-3104.
+  [Reviews percentile-based background models — percentile selection
+  depends on fraction of time foreground occupies a pixel]
+
+  Reference: Barnich, O. & Van Droogenbroeck, M. (2011). "ViBe: A Universal
+  Background Subtraction Algorithm for Video Sequences." IEEE Transactions
+  on Image Processing, 20(6), 1709-1724.
+  [Background model review — statistical background estimation from samples]
+
+------------------------------------------------------------
+SECTION 8: WHY HYSTERESIS Z-SCORE THRESHOLDING (Z_hi=3.0, Z_lo=1.5)
+------------------------------------------------------------
+
+We use two z-score thresholds rather than one:
+  Strong seeds: z ≥ 3.0 (high-confidence liquid pixels)
+  Weak candidates: z ≥ 1.5 (faint edge pixels, accepted if connected to seeds)
+
+STATISTICAL REASONING FOR z = 3.0:
+  In a normally-distributed noise model, a pixel value more than 3σ below
+  the background has probability < 0.135% of occurring by chance.
+  This gives very high confidence that such a pixel is genuine liquid.
+
+HYSTERESIS ORIGIN (Canny, 1986):
+  John Canny proved that using a single threshold for edge detection is
+  suboptimal — it either misses faint edges (high threshold) or creates
+  spurious detections (low threshold). His two-threshold "hysteresis"
+  scheme is theoretically optimal for edge detection in Gaussian noise.
+
+  We apply the same principle to foreground extraction: the strong seeds
+  guarantee high-confidence liquid pixels, and the weak threshold grows
+  them into complete contours by capturing the faint edge pixels that
+  surround every real object.
+
+  Reference: Canny, J. (1986). "A Computational Approach to Edge Detection."
+  IEEE Transactions on Pattern Analysis and Machine Intelligence, 8(6),
+  679-698.
+  [Original hysteresis thresholding paper — over 30,000 citations; proves
+  two-threshold approach is optimal for edge detection in noise]
+
+------------------------------------------------------------
+SECTION 9: WHY YOLOV8-nano-seg FOR NEURAL NETWORK DETECTION
+------------------------------------------------------------
+
+After physics-based labeling, we train YOLOv8-nano instance segmentation.
+
+WHY INSTANCE SEGMENTATION (not semantic, not detection-only):
+  Instance segmentation assigns a separate pixel-level mask to each
+  individual object. For spray research this is essential because:
+  - Droplet COUNT requires separating touching droplets into individuals
+  - Droplet SIZE requires measuring the area of each individual mask
+  - Ligament MORPHOLOGY requires the exact pixel outline of each thread
+
+  Standard object detection (bounding box only) cannot measure droplet
+  size or exact ligament shape. Semantic segmentation cannot separate
+  individual touching droplets.
+
+WHY YOLOv8 SPECIFICALLY:
+  YOLOv8 (Jocher et al., 2023) is the current state-of-the-art in
+  single-stage instance segmentation, achieving the best trade-off between
+  accuracy and inference speed. Its mask head outputs 32 prototype masks
+  combined by per-instance coefficients — computationally efficient and
+  accurate for small objects.
+
+  Reference: Jocher, G., Chaurasia, A., & Qiu, J. (2023). "Ultralytics
+  YOLO." https://github.com/ultralytics/ultralytics
+  AGPL-3.0 license.
+
+  Reference: Wang, C.-Y., Bochkovskiy, A., & Liao, H.-Y.M. (2023).
+  "YOLOv7: Trainable Bag-of-Freebies Sets New State-of-the-Art for
+  Real-Time Object Detectors." CVPR 2023.
+  [Context: YOLOv8 improves upon the YOLOv7 architecture]
+
+  Reference: Redmon, J., et al. (2016). "You Only Look Once: Unified,
+  Real-Time Object Detection." CVPR 2016.
+  [Original YOLO paper — foundation of the architecture]
+
+WHY TRANSFER LEARNING FROM COCO:
+  The COCO dataset (Lin et al., 2014) contains 80 object categories
+  including many blob-shaped and elongated objects. Pre-training on COCO
+  gives the backbone network feature detectors that already respond to:
+  - Round compact objects (similar to droplets)
+  - Thin elongated structures (similar to ligaments)
+  Fine-tuning on our spray data then specialises these pre-existing features
+  for the specific visual appearance of backlit liquid structures.
+
+  Reference: Lin, T.-Y., et al. (2014). "Microsoft COCO: Common Objects
+  in Context." ECCV 2014.
+
+------------------------------------------------------------
+SUMMARY TABLE: EVERY FEATURE AND ITS PHYSICS/LITERATURE BACKING
+------------------------------------------------------------
+
+Feature              | Threshold | Physical Basis                  | Key Reference
+---------------------|-----------|---------------------------------|------------------------
+Circularity          | ≥ 0.65    | Surface tension → sphere        | Rayleigh (1878); Lefebvre (2017)
+Solidity             | ≥ 0.80    | Droplet = convex disc           | Dumouchel (2008)
+Aspect Ratio (drop)  | ≤ 2.0     | Sphere AR = 1.0                 | Young-Laplace equation
+Aspect Ratio (lig.)  | ≥ 2.5     | Rayleigh-Plateau elongation     | Rayleigh (1878); Eggers (2008)
+LoG blob detection   | σ=1-4     | Optimal blob detector           | Marr & Hildreth (1980); Lindeberg (1994)
+Multi-scale LoG      | 5 scales  | Size-invariant detection        | Lowe (2004) / SIFT
+Edge Strength (Sobel)| ≥ 5.0     | Liquid = sharp optical boundary | Gonzalez & Woods (2018)
+Interior Ratio       | ≥ 25%     | Liquid = opaque in backlight    | Linne (2013); Sick & Stojkovic (2001)
+Background (99th %)  | p=99      | Spray ≠ total occlusion         | Piccardi (2004)
+Hysteresis z-score   | 3.0/1.5   | Optimal edge detection in noise | Canny (1986)
+
+==========================================================
+END OF PHYSICS JUSTIFICATION DOCUMENT
+==========================================================

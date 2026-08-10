@@ -77,7 +77,7 @@ def main() -> None:
         patience=args.patience,
         workers=args.workers,
         name=args.name,
-        project="runs/segment",
+        project=str(Path("runs/segment").resolve()),
         exist_ok=True,
         # ---- Mask settings (better for thin ligaments) ----
         mask_ratio=4,          # default — mask_ratio=2 requires too much VRAM for 6GB GPU

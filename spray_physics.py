@@ -130,6 +130,7 @@ DEFAULT_MAIN_AREA = 5000
 DEFAULT_SMALL_DROPLET_MAX_PIXELS = 30
 DEFAULT_SOURCE_ROI_WIDTH_FRACTION = 0.10
 DEFAULT_SOURCE_MIN_AREA = 500        # don't absorb small droplets near the inlet
+DEFAULT_INTERIOR_VETO_EROSION = 2    # px kept near large-liquid edges for boundary detail
 
 
 # --------------------------------------------------------------------------
@@ -348,7 +349,7 @@ def find_component_contours(binary: np.ndarray) -> list[tuple[np.ndarray, np.nda
         pixel_area = int(stats[label, cv2.CC_STAT_AREA])
         comp_mask = np.zeros_like(binary)
         comp_mask[labels == label] = 255
-        result = cv2.findContours(comp_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        result = cv2.findContours(comp_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
         contours = result[0] if len(result) == 2 else result[1]
         if not contours:
             continue
@@ -558,6 +559,51 @@ def detect_fine_droplets(
 
     return blobs
 
+
+# --------------------------------------------------------------------------
+# Branch C: Local-contrast medium-fragment segmentation
+# --------------------------------------------------------------------------
+def extract_medium_fragment_mask(
+    gray: np.ndarray,
+    background: BackgroundModel | None,
+    args: argparse.Namespace,
+    claimed_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """Find medium dark fragments missed by contour and fine-blob branches.
+
+    This branch is intentionally additive: it works only on unclaimed pixels
+    and needs both local darkness and either global z-score evidence or strong
+    local contrast. Static texture is filtered later by edge and motion gates.
+    """
+    mask = np.zeros_like(gray, dtype=np.uint8)
+    if not getattr(args, "enable_medium_fragments", True) or background is None:
+        return mask
+
+    aligned_bg = align_brightness(gray, background.image, args)
+    global_diff = cv2.subtract(aligned_bg, gray).astype(np.float32)
+    noise = np.maximum(background.noise, max(args.background_noise_floor, 1e-6))
+    z_map = global_diff / noise
+
+    # A broad blur estimates the local illumination behind a medium fragment.
+    local_background = cv2.GaussianBlur(gray, (0, 0), args.medium_local_sigma)
+    local_diff = cv2.subtract(local_background, gray).astype(np.float32)
+    has_local_darkness = local_diff >= args.medium_min_local_contrast
+    has_global_evidence = z_map >= args.medium_min_zscore
+    has_strong_local_darkness = local_diff >= args.medium_strong_local_contrast
+    candidate = has_local_darkness & (has_global_evidence | has_strong_local_darkness)
+
+    if claimed_mask is not None:
+        candidate[claimed_mask > 0] = False
+    mask[candidate] = 255
+
+    if args.medium_morph_open_ksize > 1:
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (args.medium_morph_open_ksize, args.medium_morph_open_ksize),
+        )
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    return mask
+
 def compute_edge_strength(gray: np.ndarray, contour: np.ndarray) -> float:
     """Mean Sobel gradient magnitude along the contour pixels.
 
@@ -726,6 +772,42 @@ def compute_features(
 # --------------------------------------------------------------------------
 # Stage 3: Physics-based classification
 # --------------------------------------------------------------------------
+def class_probabilities(feats: dict, args: argparse.Namespace) -> tuple[float, float]:
+    """Return relative droplet and ligament probabilities for an ambiguous contour.
+
+    These are interpretable, physics-informed scores normalised with a
+    softmax. They are not statistically calibrated probabilities until they
+    are fitted against hand-labelled validation masks.
+    """
+    circ = feats["circularity"]
+    solidity = feats["solidity"]
+    aspect = feats["aspect_ratio"]
+    defects = feats["defect_count"]
+    slenderness = feats["skeleton_length"] / max(feats["thickness_est"], 1.0)
+
+    def sigmoid(value: float) -> float:
+        value = max(-40.0, min(40.0, value))
+        return 1.0 / (1.0 + math.exp(-value))
+
+    droplet_score = (
+        2.0 * sigmoid((circ - args.droplet_min_circularity) / 0.12)
+        + 1.2 * sigmoid((solidity - args.droplet_min_solidity) / 0.10)
+        + 1.8 * sigmoid((args.droplet_max_aspect - aspect) / 0.35)
+    )
+    ligament_score = (
+        2.0 * sigmoid((aspect - args.ligament_min_aspect) / 0.40)
+        + 1.2 * sigmoid((args.ligament_max_circularity - circ) / 0.12)
+        + 0.9 * sigmoid((defects - args.ligament_min_defects + 0.5) / 0.50)
+        + 0.8 * sigmoid((slenderness - 3.0) / 1.50)
+    )
+
+    max_score = max(droplet_score, ligament_score)
+    droplet_exp = math.exp(droplet_score - max_score)
+    ligament_exp = math.exp(ligament_score - max_score)
+    total = droplet_exp + ligament_exp
+    return droplet_exp / total, ligament_exp / total
+
+
 def classify_physics(
     feats: dict, args: argparse.Namespace,
     img_w: int = 0, img_h: int = 0,
@@ -778,13 +860,10 @@ def classify_physics(
         return "droplet"
 
     # Gate 5: soft fallback — use the strongest remaining signal
-    if aspect > 1.8 and circ < 0.55:
-        return "ligament"
-    if solidity > 0.70 and aspect < 2.5:
-        return "droplet"
+    droplet_probability, ligament_probability = class_probabilities(feats, args)
+    return "droplet" if droplet_probability >= ligament_probability else "ligament"
 
     # Gate 6: truly ambiguous — fewer clean labels > many noisy labels
-    return "uncertain"
 
 
 # --------------------------------------------------------------------------
@@ -881,6 +960,15 @@ class PhysicsTracker:
         return results
 
 
+def erode_interior_veto(mask: np.ndarray, erosion_px: int) -> np.ndarray:
+    """Shrink large-liquid veto regions so true edge details are still visible."""
+    if erosion_px <= 0 or not np.any(mask):
+        return mask
+    kernel_size = max(3, erosion_px * 2 + 1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    return cv2.erode(mask, kernel, iterations=1)
+
+
 # --------------------------------------------------------------------------
 # Stage 5: Full frame analysis
 # --------------------------------------------------------------------------
@@ -898,6 +986,7 @@ def analyze_frame(
     detections: list[Detection] = []
     kept_contours: list[np.ndarray] = []
     branch_a_mask = np.zeros((img_h, img_w), dtype=np.uint8)
+    large_liquid_mask = np.zeros((img_h, img_w), dtype=np.uint8)
 
     for idx, (contour, comp_mask, pixel_area) in enumerate(components):
         if pixel_area < args.min_area:
@@ -926,13 +1015,25 @@ def analyze_frame(
             )
         )
         kept_contours.append(contour)
-        cv2.drawContours(branch_a_mask, [contour], -1, 255, thickness=cv2.FILLED)
+        # Large connected liquid structures are still detections, but their
+        # interiors veto small/medium recovery so texture/voids do not become
+        # fake detached droplets.
+        if label != "main_jet":
+            cv2.drawContours(branch_a_mask, [contour], -1, 255, thickness=cv2.FILLED)
+        if label in {"main_jet", "main_ligament", "ligament"}:
+            cv2.drawContours(large_liquid_mask, [contour], -1, 255, thickness=cv2.FILLED)
 
     # Fine blobs use the raw image and bypass Branch A's median filtering.
     # They still enter the common tracker below, so static specks are removed
     # by the existing persistence and motion checks.
     raw_gray = to_gray(frame)
-    fine_blobs = detect_fine_droplets(raw_gray, background, args, branch_a_mask)
+    interior_veto_mask = erode_interior_veto(
+        large_liquid_mask,
+        getattr(args, "interior_veto_erosion", 0),
+    )
+    fine_exclusion_mask = cv2.bitwise_or(branch_a_mask, interior_veto_mask)
+    fine_blobs = detect_fine_droplets(raw_gray, background, args, fine_exclusion_mask)
+    branch_b_mask = np.zeros((img_h, img_w), dtype=np.uint8)
     for fine_idx, (contour, pixel_area) in enumerate(fine_blobs):
         if pixel_area < args.min_area:
             continue
@@ -945,6 +1046,37 @@ def analyze_frame(
                 track_id=-1,
                 label="droplet",
                 contour_index=len(components) + fine_idx,
+                velocity_x=0.0,
+                velocity_y=0.0,
+                speed=0.0,
+                **feats,
+            )
+        )
+        kept_contours.append(contour)
+        cv2.drawContours(binary, [contour], -1, 255, thickness=cv2.FILLED)
+        cv2.drawContours(branch_b_mask, [contour], -1, 255, thickness=cv2.FILLED)
+
+    # Medium fragments are evaluated only outside the existing contour and
+    # fine-droplet masks, keeping Branch C additive rather than disruptive.
+    claimed_mask = cv2.bitwise_or(fine_exclusion_mask, branch_b_mask)
+    medium_mask = extract_medium_fragment_mask(raw_gray, background, args, claimed_mask)
+    medium_mask = split_touching_components(medium_mask, args)
+    medium_components = find_component_contours(medium_mask)
+    for medium_idx, (contour, component_mask, pixel_area) in enumerate(medium_components):
+        if not args.medium_min_area <= pixel_area <= args.medium_max_area:
+            continue
+        feats = compute_features(contour, component_mask, pixel_area, raw_gray, background)
+        if feats["edge_strength"] < args.medium_min_edge_strength:
+            continue
+        if background is not None and feats["interior_ratio"] < args.medium_min_interior_ratio:
+            continue
+        label = classify_physics(feats, args, img_w=img_w, img_h=img_h, contour=contour)
+        detections.append(
+            Detection(
+                frame=frame_id,
+                track_id=-1,
+                label=label,
+                contour_index=len(components) + len(fine_blobs) + medium_idx,
                 velocity_x=0.0,
                 velocity_y=0.0,
                 speed=0.0,
@@ -1108,13 +1240,18 @@ def process_frames(args: argparse.Namespace) -> None:
                 velocity_y=velocity[1],
                 speed=speed,
             )
-            # Reject static tiny objects (background texture)
+            # Reject static candidates from the fine and medium recovery paths.
             is_static_small = (
                 final.pixel_area <= args.small_droplet_max_pixels
                 and hits >= 2
                 and speed < args.min_small_droplet_speed
             )
-            if is_static_small:
+            is_static_medium = (
+                args.medium_min_area <= final.pixel_area <= args.medium_max_area
+                and hits >= 2
+                and speed < args.medium_min_speed
+            )
+            if is_static_small or is_static_medium:
                 continue
             if confirmed or args.draw_tentative:
                 final_dets.append(final)
@@ -1176,7 +1313,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Strong z-score threshold (seeds). Higher = stricter.")
     p.add_argument("--background-zscore-lo", type=float, default=1.5,
                     help="Weak z-score threshold (growth). Lower = captures fainter edges.")
-    p.add_argument("--min-foreground-contrast", type=int, default=4,
+    p.add_argument("--min-foreground-contrast", type=int, default=8,
                     help="Minimum absolute BG-FG intensity difference.")
 
     # Preprocessing
@@ -1188,9 +1325,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Closing kernel size. Bridges small gaps.")
 
     # Quality gates
-    p.add_argument("--min-edge-strength", type=float, default=3.0,
+    p.add_argument("--min-edge-strength", type=float, default=5.0,
                     help="Minimum mean Sobel gradient along the contour. Rejects soft-gradient false contours.")
-    p.add_argument("--min-interior-ratio", type=float, default=0.05,
+    p.add_argument("--min-interior-ratio", type=float, default=0.25,
                     help="Minimum fraction of interior pixels darker than background. Rejects transparent/noise contours.")
 
     # Classification
@@ -1200,6 +1337,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Width of the left-side source ROI as a fraction of the frame width.")
     p.add_argument("--source-min-area", type=int, default=DEFAULT_SOURCE_MIN_AREA,
                     help="Min area (px) for a source-ROI contour to be classified as main jet.")
+    p.add_argument("--interior-veto-erosion", type=int, default=DEFAULT_INTERIOR_VETO_EROSION,
+                    help="Shrink large-liquid interiors by this many px before vetoing LoG/medium recovery.")
+    p.add_argument("--main-jet-child-overlap-veto", type=float, default=0.35,
+                    help="Drop non-main labels when this fraction overlaps the main-jet interior.")
     p.add_argument("--small-droplet-max-pixels", type=int, default=DEFAULT_SMALL_DROPLET_MAX_PIXELS)
     p.add_argument("--small-droplet-max-aspect", type=float, default=2.5)
     p.add_argument("--droplet-min-circularity", type=float, default=DEFAULT_DROPLET_MIN_CIRCULARITY)
@@ -1218,14 +1359,39 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Largest LoG sigma (detects ~12px blobs).")
     p.add_argument("--log-num-scales", type=int, default=5,
                     help="Number of LoG scales between sigma-min and sigma-max.")
-    p.add_argument("--log-threshold", type=float, default=0.20,
+    p.add_argument("--log-threshold", type=float, default=0.45,
                     help="Minimum noise-normalised LoG response to accept a blob.")
     p.add_argument("--log-max-radius", type=float, default=15.0,
                     help="Maximum blob radius in pixels.")
-    p.add_argument("--log-min-center-z", type=float, default=1.0,
+    p.add_argument("--log-min-center-z", type=float, default=2.0,
                     help="Minimum background-noise-normalised darkness at a blob centre.")
-    p.add_argument("--log-min-center-delta-z", type=float, default=0.5,
+    p.add_argument("--log-min-center-delta-z", type=float, default=1.2,
                     help="Minimum centre-to-annulus darkness difference in local noise units.")
+
+    # Branch C: medium irregular fragments. Kept separate from branches A/B.
+    p.add_argument("--disable-medium-fragments", action="store_false", dest="enable_medium_fragments",
+                    help="Disable local-contrast recovery of medium breakup fragments.")
+    p.set_defaults(enable_medium_fragments=True)
+    p.add_argument("--medium-local-sigma", type=float, default=9.0,
+                    help="Gaussian scale for the local background estimate.")
+    p.add_argument("--medium-min-local-contrast", type=float, default=3.0,
+                    help="Minimum local darkness difference for a medium candidate.")
+    p.add_argument("--medium-strong-local-contrast", type=float, default=8.0,
+                    help="Local contrast that can compensate for weak global z-score evidence.")
+    p.add_argument("--medium-min-zscore", type=float, default=0.75,
+                    help="Minimum global z-score for normally contrasted medium candidates.")
+    p.add_argument("--medium-morph-open-ksize", type=int, default=1,
+                    help="Opening kernel used only by the medium-fragment branch.")
+    p.add_argument("--medium-min-area", type=int, default=12,
+                    help="Smallest component handled by the medium-fragment branch.")
+    p.add_argument("--medium-max-area", type=int, default=1800,
+                    help="Largest component handled by the medium-fragment branch.")
+    p.add_argument("--medium-min-edge-strength", type=float, default=4.0,
+                    help="Minimum contour edge strength for a medium fragment.")
+    p.add_argument("--medium-min-interior-ratio", type=float, default=0.02,
+                    help="Minimum dark-interior fraction for a medium fragment.")
+    p.add_argument("--medium-min-speed", type=float, default=0.5,
+                    help="Minimum observed motion for a confirmed medium fragment.")
 
     # Split compact, multi-peak droplet clusters without fragmenting ligaments.
     p.add_argument("--disable-watershed", action="store_false", dest="enable_watershed",

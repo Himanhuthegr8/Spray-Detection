@@ -68,8 +68,14 @@ OUTPUT_DIR = Path("yolo_dataset")
 LABEL_MAP = {
     "droplet": 0,
     "ligament": 1,
+    "main_jet": 2,
 }
-CLASS_NAMES = {0: "droplet", 1: "ligament"}
+CLASS_NAMES = {0: "droplet", 1: "ligament", 2: "main_jet"}
+PREVIEW_COLORS = {
+    0: (0, 200, 255),    # droplet: orange (BGR)
+    1: (255, 0, 255),    # ligament: magenta (BGR)
+    2: (255, 255, 0),    # main jet: cyan (BGR)
+}
 
 # Train / val / test split ratios
 TRAIN_RATIO = 0.80
@@ -156,7 +162,7 @@ class FineDropletTracker:
 
 
 def contour_to_yolo_polygon(
-    contour: np.ndarray, img_w: int, img_h: int,
+    contour: np.ndarray, img_w: int, img_h: int, class_id: int | None = None,
 ) -> list[float] | None:
     """Convert an OpenCV contour to a normalised YOLO polygon.
 
@@ -174,10 +180,11 @@ def contour_to_yolo_polygon(
     short = max(min(rw, rh), 1e-6)
     aspect = max(rw, rh) / short
 
-    # Thin ligaments (aspect > 3): very tight simplification (0.002)
-    # Medium shapes: moderate (0.005)
-    # Round droplets: more aggressive (0.01)
-    if aspect > 3.0:
+    # Main jet / source ligament needs a very faithful outline. Round droplets
+    # can tolerate more simplification.
+    if class_id == LABEL_MAP["main_jet"]:
+        eps_factor = 0.001
+    elif aspect > 3.0:
         eps_factor = 0.002
     elif aspect > 1.8:
         eps_factor = 0.005
@@ -196,6 +203,89 @@ def contour_to_yolo_polygon(
         coords.append(round(float(x) / img_w, 6))
         coords.append(round(float(y) / img_h, 6))
     return coords
+
+
+def contour_overlap_fraction(contour: np.ndarray, owner_mask: np.ndarray) -> float:
+    """Fraction of a candidate contour area covered by an owning liquid mask."""
+    if not np.any(owner_mask):
+        return 0.0
+    candidate_mask = np.zeros_like(owner_mask)
+    cv2.drawContours(candidate_mask, [contour], -1, 255, cv2.FILLED)
+    area = int(cv2.countNonZero(candidate_mask))
+    if area == 0:
+        return 0.0
+    overlap = cv2.bitwise_and(candidate_mask, owner_mask)
+    return float(cv2.countNonZero(overlap)) / float(area)
+
+
+def write_label_preview(image_path: Path, label_path: Path, output_path: Path) -> dict[int, int]:
+    """Render final YOLO-seg polygons without per-instance text clutter.
+
+    All exported masks receive a translucent fill. Main jet is drawn first
+    and with a stronger outline so overlap mistakes are easy to spot.
+    """
+    image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    if image is None:
+        return {}
+    height, width = image.shape[:2]
+    overlay = image.copy()
+    counts = {class_id: 0 for class_id in CLASS_NAMES}
+    outlines: list[tuple[np.ndarray, tuple[int, int, int], int]] = []
+    entries: list[tuple[int, np.ndarray, tuple[int, int, int]]] = []
+
+    for raw_line in label_path.read_text(encoding="utf-8").splitlines():
+        parts = raw_line.split()
+        if len(parts) < 7:
+            continue
+        try:
+            class_id = int(parts[0])
+            coords = np.asarray(parts[1:], dtype=np.float32).reshape(-1, 2)
+        except (ValueError, TypeError):
+            continue
+        color = PREVIEW_COLORS.get(class_id)
+        if color is None or len(coords) < MIN_POLYGON_POINTS:
+            continue
+        coords[:, 0] *= width - 1
+        coords[:, 1] *= height - 1
+        polygon = np.rint(coords).astype(np.int32).reshape(-1, 1, 2)
+        entries.append((class_id, polygon, color))
+        counts[class_id] = counts.get(class_id, 0) + 1
+
+    entries.sort(key=lambda item: 0 if item[0] == LABEL_MAP["main_jet"] else 1)
+    for class_id, polygon, color in entries:
+        cv2.fillPoly(overlay, [polygon], color)
+        outlines.append((polygon, color, 2 if class_id == LABEL_MAP["main_jet"] else 1))
+
+    annotated = cv2.addWeighted(overlay, 0.22, image, 0.78, 0)
+    for polygon, color, thickness in outlines:
+        cv2.polylines(annotated, [polygon], True, color, thickness, cv2.LINE_AA)
+    cv2.rectangle(annotated, (8, 8), (330, 82), (24, 24, 24), cv2.FILLED)
+    cv2.putText(
+        annotated,
+        f"{image_path.stem} final YOLO-seg labels",
+        (14, 29),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.42,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+    legend = [(0, "droplet"), (1, "ligament"), (2, "main jet")]
+    for index, (class_id, name) in enumerate(legend):
+        x = 14 + index * 104
+        cv2.circle(annotated, (x, 53), 4, PREVIEW_COLORS[class_id], cv2.FILLED)
+        cv2.putText(
+            annotated,
+            f"{name}: {counts[class_id]}",
+            (x + 8, 57),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.32,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+    cv2.imwrite(str(output_path), annotated)
+    return counts
 
 
 def build_physics_args() -> argparse.Namespace:
@@ -218,6 +308,7 @@ def process_frame_physics(
     background: sp.BackgroundModel | None,
     args: argparse.Namespace,
     fine_tracker: FineDropletTracker | None = None,
+    medium_tracker: FineDropletTracker | None = None,
 ) -> list[str]:
     """Segment a single frame using the dual-branch PHYSICS pipeline.
 
@@ -239,6 +330,9 @@ def process_frame_physics(
 
     lines: list[str] = []
     branch_a_mask = np.zeros((img_h, img_w), dtype=np.uint8)
+    large_liquid_mask = np.zeros((img_h, img_w), dtype=np.uint8)
+    main_jet_mask = np.zeros((img_h, img_w), dtype=np.uint8)
+    branch_a_candidates: list[tuple[int, np.ndarray, list[float]]] = []
 
     for contour, comp_mask, pixel_area in components:
         if pixel_area < MIN_AREA_PIXELS:
@@ -257,27 +351,46 @@ def process_frame_physics(
         # Physics classification (with boundary-aware main jet detection)
         label = sp.classify_physics(feats, args, img_w=img_w, img_h=img_h, contour=contour)
 
-        # Mark Branch A coverage for deduplication with Branch B
-        cv2.drawContours(branch_a_mask, [contour], -1, 255, cv2.FILLED)
+        # Large connected liquid structures are exported as labels, but their
+        # interiors veto small/medium recovery so internal texture is not
+        # turned into separate droplets.
+        if label != "main_jet":
+            cv2.drawContours(branch_a_mask, [contour], -1, 255, cv2.FILLED)
+        if label in {"main_jet", "main_ligament", "ligament"}:
+            cv2.drawContours(large_liquid_mask, [contour], -1, 255, cv2.FILLED)
+        if label == "main_jet":
+            cv2.drawContours(main_jet_mask, [contour], -1, 255, cv2.FILLED)
 
-        # Map to YOLO class — main_jet and uncertain are skipped
+        # Map the physics label to a YOLO class.
         class_id = LABEL_MAP.get(label)
         if class_id is None:
             continue
 
-        polygon = contour_to_yolo_polygon(contour, img_w, img_h)
+        polygon = contour_to_yolo_polygon(contour, img_w, img_h, class_id)
         if polygon is None:
             continue
 
+        branch_a_candidates.append((class_id, contour, polygon))
+
+    for class_id, contour, polygon in branch_a_candidates:
+        if class_id != LABEL_MAP["main_jet"]:
+            overlap = contour_overlap_fraction(contour, main_jet_mask)
+            if overlap >= getattr(args, "main_jet_child_overlap_veto", 0.35):
+                continue
         coord_str = " ".join(f"{c:.6f}" for c in polygon)
         lines.append(f"{class_id} {coord_str}")
 
     # ===== Branch B: LoG fine-droplet detection =====
     # Use raw grayscale (not denoised) — preserves tiny blobs
     raw_gray = sp.to_gray(frame)
+    interior_veto_mask = sp.erode_interior_veto(
+        large_liquid_mask,
+        getattr(args, "interior_veto_erosion", 0),
+    )
+    fine_exclusion_mask = cv2.bitwise_or(branch_a_mask, interior_veto_mask)
     fine_blobs = [
         (contour, area)
-        for contour, area in sp.detect_fine_droplets(raw_gray, background, args, branch_a_mask)
+        for contour, area in sp.detect_fine_droplets(raw_gray, background, args, fine_exclusion_mask)
         if area >= MIN_AREA_PIXELS
     ]
     confirmed = (
@@ -285,18 +398,57 @@ def process_frame_physics(
         if fine_tracker is not None
         else [True] * len(fine_blobs)
     )
+    branch_b_mask = np.zeros((img_h, img_w), dtype=np.uint8)
 
     for (blob_contour, blob_area), is_confirmed in zip(fine_blobs, confirmed):
+        cv2.drawContours(branch_b_mask, [blob_contour], -1, 255, cv2.FILLED)
         if not is_confirmed:
             continue
 
         # All LoG blobs are classified as droplets
         class_id = 0  # droplet
 
-        polygon = contour_to_yolo_polygon(blob_contour, img_w, img_h)
+        polygon = contour_to_yolo_polygon(blob_contour, img_w, img_h, class_id)
         if polygon is None:
             continue
 
+        coord_str = " ".join(f"{c:.6f}" for c in polygon)
+        lines.append(f"{class_id} {coord_str}")
+
+    # ===== Branch C: medium irregular fragments =====
+    claimed_mask = cv2.bitwise_or(fine_exclusion_mask, branch_b_mask)
+    medium_mask = sp.extract_medium_fragment_mask(raw_gray, background, args, claimed_mask)
+    medium_mask = sp.split_touching_components(medium_mask, args)
+    medium_components = [
+        component
+        for component in sp.find_component_contours(medium_mask)
+        if args.medium_min_area <= component[2] <= args.medium_max_area
+    ]
+    medium_confirmed = (
+        medium_tracker.update([contour for contour, _, _ in medium_components], frame_id)
+        if medium_tracker is not None
+        else [True] * len(medium_components)
+    )
+
+    for (contour, component_mask, pixel_area), is_confirmed in zip(medium_components, medium_confirmed):
+        if not is_confirmed:
+            continue
+        feats = sp.compute_features(contour, component_mask, pixel_area, raw_gray, background)
+        if feats["edge_strength"] < args.medium_min_edge_strength:
+            continue
+        if background is not None and feats["interior_ratio"] < args.medium_min_interior_ratio:
+            continue
+        label = sp.classify_physics(feats, args, img_w=img_w, img_h=img_h, contour=contour)
+        class_id = LABEL_MAP.get(label)
+        if class_id is None:
+            continue
+        if class_id != LABEL_MAP["main_jet"]:
+            overlap = contour_overlap_fraction(contour, main_jet_mask)
+            if overlap >= getattr(args, "main_jet_child_overlap_veto", 0.35):
+                continue
+        polygon = contour_to_yolo_polygon(contour, img_w, img_h, class_id)
+        if polygon is None:
+            continue
         coord_str = " ".join(f"{c:.6f}" for c in polygon)
         lines.append(f"{class_id} {coord_str}")
 
@@ -327,7 +479,7 @@ def process_frame_legacy(
         class_id = LABEL_MAP.get(label)
         if class_id is None:
             continue
-        polygon = contour_to_yolo_polygon(contour, img_w, img_h)
+        polygon = contour_to_yolo_polygon(contour, img_w, img_h, class_id)
         if polygon is None:
             continue
         coord_str = " ".join(f"{c:.6f}" for c in polygon)
@@ -344,14 +496,30 @@ def main() -> None:
     )
     parser.add_argument("--dataset", default="dataset", help="Input frames directory.")
     parser.add_argument("--output", default="yolo_dataset", help="Output dataset directory.")
-    parser.add_argument("--fine-track-distance", type=float, default=12.0,
+    parser.add_argument("--fine-track-distance", type=float, default=20.0,
                         help="Maximum fine-droplet displacement between adjacent frames.")
     parser.add_argument("--fine-track-min-displacement", type=float, default=0.5,
                         help="Minimum movement needed to reject static fine candidates.")
     parser.add_argument("--fine-track-min-hits", type=int, default=2,
                         help="Observations required before exporting a fine-droplet mask.")
-    parser.add_argument("--fine-track-max-age", type=int, default=1,
+    parser.add_argument("--fine-track-max-age", type=int, default=2,
                         help="Missed frames retained for a fine-droplet track.")
+    parser.add_argument("--medium-track-distance", type=float, default=20.0,
+                        help="Maximum medium-fragment displacement between adjacent frames.")
+    parser.add_argument("--medium-track-min-displacement", type=float, default=0.5,
+                        help="Minimum movement needed to reject static medium candidates.")
+    parser.add_argument("--medium-track-min-hits", type=int, default=2,
+                        help="Observations required before exporting a medium-fragment mask.")
+    parser.add_argument("--medium-track-max-age", type=int, default=1,
+                        help="Missed frames retained for a medium-fragment track.")
+    parser.add_argument("--interior-veto-erosion", type=int, default=None,
+                        help="Override physics interior veto erosion in pixels. Lower is stricter.")
+    parser.add_argument("--main-jet-child-overlap-veto", type=float, default=None,
+                        help="Override overlap fraction used to suppress droplet/ligament labels inside main jet.")
+    parser.add_argument("--preview-count", type=int, default=10,
+                        help="Number of representative coloured label previews to write.")
+    parser.add_argument("--preview-frames", nargs="*", type=int,
+                        help="Specific frame numbers to render instead of evenly spaced previews.")
     cli_args = parser.parse_args()
 
     dataset_dir = Path(cli_args.dataset)
@@ -372,6 +540,10 @@ def main() -> None:
     # Build background + args for the chosen pipeline
     if use_physics:
         args = build_physics_args()
+        if cli_args.interior_veto_erosion is not None:
+            args.interior_veto_erosion = cli_args.interior_veto_erosion
+        if cli_args.main_jet_child_overlap_veto is not None:
+            args.main_jet_child_overlap_veto = cli_args.main_jet_child_overlap_veto
         background = sp.load_background(args, frame_paths)
         process_fn = process_frame_physics
     else:
@@ -390,6 +562,7 @@ def main() -> None:
         print(f"\n  Branch A: hysteresis z-score [{args.background_zscore_lo}, {args.background_zscore_hi}]")
         print(f"            morph-close={args.morph_close_ksize}, edge-strength>={args.min_edge_strength}")
         print(f"  Branch B: LoG blobs sigma=[{args.log_sigma_min}, {args.log_sigma_max}], threshold={args.log_threshold}")
+        print(f"  Branch C: medium fragments area=[{args.medium_min_area}, {args.medium_max_area}]")
         print(f"  Main jet: left source ROI={args.source_roi_width_fraction:.0%}, min-area={args.source_min_area}px")
         print("  Watershed: enabled for compact multi-peak components")
         print(f"  Export:   MIN_AREA_PIXELS={MIN_AREA_PIXELS}")
@@ -419,7 +592,13 @@ def main() -> None:
         (output_dir / split / "labels").mkdir(parents=True, exist_ok=True)
 
     # Process every frame
-    stats = {"total_objects": 0, "droplets": 0, "ligaments": 0, "frames_processed": 0}
+    stats = {
+        "total_objects": 0,
+        "droplets": 0,
+        "ligaments": 0,
+        "main_jets": 0,
+        "frames_processed": 0,
+    }
     fine_tracker = (
         FineDropletTracker(
             cli_args.fine_track_distance,
@@ -430,13 +609,30 @@ def main() -> None:
         if use_physics
         else None
     )
+    medium_tracker = (
+        FineDropletTracker(
+            cli_args.medium_track_distance,
+            cli_args.medium_track_min_displacement,
+            cli_args.medium_track_min_hits,
+            cli_args.medium_track_max_age,
+        )
+        if use_physics
+        else None
+    )
 
     for idx, frame_path in enumerate(frame_paths):
         frame_id = sp.frame_number(frame_path)
         split = split_map[idx]
 
         if use_physics:
-            label_lines = process_frame_physics(frame_path, frame_id, background, args, fine_tracker)
+            label_lines = process_frame_physics(
+                frame_path,
+                frame_id,
+                background,
+                args,
+                fine_tracker,
+                medium_tracker,
+            )
         else:
             label_lines = process_fn(frame_path, frame_id, background, args)
 
@@ -445,8 +641,10 @@ def main() -> None:
             stats["total_objects"] += 1
             if cls == 0:
                 stats["droplets"] += 1
-            else:
+            elif cls == 1:
                 stats["ligaments"] += 1
+            elif cls == 2:
+                stats["main_jets"] += 1
 
         # Copy image
         dst_img = output_dir / split / "images" / frame_path.name
@@ -467,7 +665,8 @@ def main() -> None:
             print(
                 f"  [{pct:5.1f}%] Processed {idx + 1}/{len(frame_paths)} frames "
                 f"| Objects: {stats['total_objects']} "
-                f"(droplets={stats['droplets']}, ligaments={stats['ligaments']})"
+                f"(droplets={stats['droplets']}, ligaments={stats['ligaments']}, "
+                f"main_jets={stats['main_jets']})"
             )
 
     # Write data.yaml
@@ -483,6 +682,31 @@ def main() -> None:
     with open(yaml_path, "w") as f:
         yaml.dump(data_yaml, f, default_flow_style=False, sort_keys=False)
 
+    # Render a small, readable sample from the exact label files written above.
+    preview_dir = output_dir / "preview"
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    if cli_args.preview_frames:
+        requested = set(cli_args.preview_frames)
+        preview_indices = [
+            index for index, path in enumerate(frame_paths)
+            if sp.frame_number(path) in requested
+        ]
+    elif cli_args.preview_count > 0:
+        preview_total = min(cli_args.preview_count, len(frame_paths))
+        preview_indices = np.linspace(0, len(frame_paths) - 1, preview_total, dtype=int).tolist()
+    else:
+        preview_indices = []
+
+    for index in dict.fromkeys(preview_indices):
+        frame_path = frame_paths[index]
+        split = split_map[index]
+        image_path = output_dir / split / "images" / frame_path.name
+        label_path = output_dir / split / "labels" / f"{frame_path.stem}.txt"
+        preview_path = preview_dir / f"preview_{frame_path.name}"
+        write_label_preview(image_path, label_path, preview_path)
+    if preview_indices:
+        print(f"  Previews       : {len(dict.fromkeys(preview_indices))} in {preview_dir}")
+
     # Summary
     print("\n" + "=" * 60)
     print("  Dataset Preparation Complete!")
@@ -494,6 +718,7 @@ def main() -> None:
     print(f"  Total objects  : {stats['total_objects']}")
     print(f"    - droplets   : {stats['droplets']}")
     print(f"    - ligaments  : {stats['ligaments']}")
+    print(f"    - main jets  : {stats['main_jets']}")
     print(f"  Train images   : {split_counts['train']}")
     print(f"  Val images     : {split_counts['val']}")
     print(f"  Test images    : {split_counts['test']}")

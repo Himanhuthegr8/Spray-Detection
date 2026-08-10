@@ -44,10 +44,13 @@ C_INTERIOR  = (50, 100, 180)   # brown — rejected by interior ratio
 C_AREA      = (0, 140, 255)    # orange — rejected by area
 C_LOG_BLOB  = (0, 255, 128)    # light green — LoG fine droplet
 
+C_MEDIUM = (255, 255, 0)
+
 LEGEND = [
     ("accepted: droplet", C_DROPLET),
     ("accepted: ligament", C_LIGAMENT),
     ("accepted: LoG blob", C_LOG_BLOB),
+    ("candidate: medium fragment", C_MEDIUM),
     ("excluded: main_jet", C_MAIN_JET),
     ("rejected: uncertain", C_UNCERTAIN),
     ("rejected: edge strength", C_EDGE),
@@ -84,8 +87,9 @@ def analyze_frame_with_rejections(
     components = sp.find_component_contours(binary_clean)
 
     branch_a_mask = np.zeros((img_h, img_w), dtype=np.uint8)
+    large_liquid_mask = np.zeros((img_h, img_w), dtype=np.uint8)
     stats = {k: 0 for k in ["droplet", "ligament", "main_jet", "uncertain",
-                              "rej_edge", "rej_interior", "rej_area", "log_blob"]}
+                              "rej_edge", "rej_interior", "rej_area", "log_blob", "medium"]}
 
     for contour, comp_mask, pixel_area in components:
         # --- Rejection: area ---
@@ -110,7 +114,13 @@ def analyze_frame_with_rejections(
 
         # --- Classification ---
         label = sp.classify_physics(feats, args, img_w=img_w, img_h=img_h, contour=contour)
-        cv2.drawContours(branch_a_mask, [contour], -1, 255, cv2.FILLED)
+        # Large connected liquid structures are shown as detections, but their
+        # interiors veto small/medium recovery so internal texture is not
+        # shown as separate droplets.
+        if label != "main_jet":
+            cv2.drawContours(branch_a_mask, [contour], -1, 255, cv2.FILLED)
+        if label in {"main_jet", "main_ligament", "ligament"}:
+            cv2.drawContours(large_liquid_mask, [contour], -1, 255, cv2.FILLED)
 
         if label == "main_jet" or label == "main_ligament":
             cv2.drawContours(output, [contour], -1, C_MAIN_JET, 2)
@@ -133,15 +143,40 @@ def analyze_frame_with_rejections(
 
     # ===== Branch B: LoG blobs =====
     raw_gray = sp.to_gray(frame)
-    fine_blobs = sp.detect_fine_droplets(raw_gray, background, args, branch_a_mask)
+    interior_veto_mask = sp.erode_interior_veto(
+        large_liquid_mask,
+        getattr(args, "interior_veto_erosion", 0),
+    )
+    fine_exclusion_mask = cv2.bitwise_or(branch_a_mask, interior_veto_mask)
+    fine_blobs = sp.detect_fine_droplets(raw_gray, background, args, fine_exclusion_mask)
+    branch_b_mask = np.zeros((img_h, img_w), dtype=np.uint8)
     for blob_contour, blob_area in fine_blobs:
         if blob_area < 3:
             continue
+        cv2.drawContours(branch_b_mask, [blob_contour], -1, 255, cv2.FILLED)
         overlay = output.copy()
         cv2.drawContours(overlay, [blob_contour], -1, C_LOG_BLOB, cv2.FILLED)
         cv2.addWeighted(overlay, 0.3, output, 0.7, 0, output)
         cv2.drawContours(output, [blob_contour], -1, C_LOG_BLOB, 1)
         stats["log_blob"] += 1
+
+    # ===== Branch C: medium irregular fragments =====
+    claimed_mask = cv2.bitwise_or(fine_exclusion_mask, branch_b_mask)
+    medium_mask = sp.extract_medium_fragment_mask(raw_gray, background, args, claimed_mask)
+    medium_mask = sp.split_touching_components(medium_mask, args)
+    for contour, component_mask, pixel_area in sp.find_component_contours(medium_mask):
+        if not args.medium_min_area <= pixel_area <= args.medium_max_area:
+            continue
+        feats = sp.compute_features(contour, component_mask, pixel_area, raw_gray, background)
+        if feats["edge_strength"] < args.medium_min_edge_strength:
+            continue
+        if background is not None and feats["interior_ratio"] < args.medium_min_interior_ratio:
+            continue
+        overlay = output.copy()
+        cv2.drawContours(overlay, [contour], -1, C_MEDIUM, cv2.FILLED)
+        cv2.addWeighted(overlay, 0.25, output, 0.75, 0, output)
+        cv2.drawContours(output, [contour], -1, C_MEDIUM, 1)
+        stats["medium"] += 1
 
     # Draw legend
     draw_legend(output)
