@@ -76,7 +76,7 @@ def draw_masks_only(frame: np.ndarray, result) -> np.ndarray:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Frame-by-frame YOLO inference on a spray video.")
-    p.add_argument("--model",  default="runs/segment/spray_seg/weights/best.pt",
+    p.add_argument("--model",  default="runs/segment/spray_seg_titan/weights/best.pt",
                    help="Path to trained model weights.")
     p.add_argument("--source", default="Drop.avi",
                    help="Input video file.")
@@ -84,10 +84,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Output annotated video filename.")
     p.add_argument("--frames-dir", default="annotated_frames",
                    help="Temporary directory for individual annotated frames.")
-    p.add_argument("--conf",   type=float, default=0.25,
-                   help="Detection confidence threshold.")
-    p.add_argument("--imgsz",  type=int,   default=480,
-                   help="Inference image size (must match training size).")
+    p.add_argument("--conf",   type=float, default=0.10,
+                   help="Detection confidence threshold (low=more small droplets).")
+    p.add_argument("--imgsz",  type=int,   default=640,
+                   help="Inference image size (matches training size; upscales 512px frames for better tiny-droplet detection).")
     p.add_argument("--keep-frames", action="store_true",
                    help="Keep individual frame PNGs after video is assembled.")
     return p

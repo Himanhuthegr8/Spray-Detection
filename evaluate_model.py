@@ -27,19 +27,19 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Evaluate a trained YOLOv8-seg model.")
     p.add_argument(
         "--model",
-        default="runs/segment/spray_seg/weights/best.pt",
+        default="runs/segment/spray_seg_titan/weights/best.pt",
         help="Path to the trained model weights.",
     )
     p.add_argument(
         "--data",
-        default="yolo_dataset/data.yaml",
+        default="yolo_dataset_v3/data.yaml",
         help="Path to data.yaml.",
     )
     p.add_argument(
-        "--imgsz", type=int, default=512, help="Inference image size."
+        "--imgsz", type=int, default=640, help="Inference image size (match training)."
     )
     p.add_argument(
-        "--conf", type=float, default=0.25, help="Confidence threshold for predictions."
+        "--conf", type=float, default=0.10, help="Confidence threshold (low=catches tiny droplets)."
     )
     p.add_argument(
         "--predict-samples",

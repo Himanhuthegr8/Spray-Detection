@@ -1,12 +1,13 @@
 """
 train_yolo.py
 =============
-Train a YOLOv8 instance-segmentation model on the prepared spray dataset.
+Train a YOLO11 instance-segmentation model on the prepared spray dataset.
 
 Usage:
-    python train_yolo.py                          # defaults (yolov8n-seg, 100 epochs)
-    python train_yolo.py --model yolov8s-seg      # larger model
-    python train_yolo.py --epochs 50 --batch 8    # custom training
+    python train_yolo.py                                    # defaults (yolo11m-seg, batch=8, imgsz=640)
+    python train_yolo.py --batch 4                          # even lower VRAM (~4GB GPU)
+    python train_yolo.py --model yolo11s-seg.pt --batch 4   # small model, extremely fast & low VRAM
+    python train_yolo.py --model yolo11n-seg.pt --batch 2   # nano model (ultra low VRAM)
 
 The trained model is saved under  runs/segment/spray_*  inside this directory.
 """
@@ -16,29 +17,31 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import torch
 from ultralytics import YOLO
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Train YOLOv8-seg on the spray droplet / ligament dataset."
+        description="Train YOLO11-seg on the spray droplet / ligament / main_jet dataset."
     )
     p.add_argument(
         "--model",
-        default="yolov8s-seg.pt",
-        help="Pre-trained YOLO model checkpoint (default: yolov8s-seg.pt = small).",
+        default="yolo11m-seg.pt",
+        help="Pre-trained YOLO model checkpoint (default: yolo11m-seg.pt = medium, memory efficient).",
     )
     p.add_argument(
         "--data",
-        default="yolo_dataset/data.yaml",
+        default="yolo_dataset_v3/data.yaml",
         help="Path to data.yaml created by prepare_yolo_dataset.py.",
     )
-    p.add_argument("--epochs", type=int, default=100, help="Maximum training epochs.")
-    p.add_argument("--batch", type=int, default=8, help="Batch size.")
+    p.add_argument("--epochs", type=int, default=80, help="Maximum training epochs.")
+    p.add_argument("--batch", type=int, default=8, help="Batch size (default: 8, lower to 4 or 2 if VRAM is low).")
     p.add_argument("--imgsz", type=int, default=640, help="Training image size.")
     p.add_argument("--patience", type=int, default=20, help="Early-stopping patience.")
-    p.add_argument("--workers", type=int, default=4, help="Dataloader workers.")
-    p.add_argument("--name", default="spray_seg", help="Run name (under runs/segment/).")
+    p.add_argument("--workers", type=int, default=2, help="Dataloader workers.")
+    p.add_argument("--mask-ratio", type=int, default=4, help="Mask downsample ratio (default: 4 saves VRAM).")
+    p.add_argument("--name", default="spray_seg_titan", help="Run name (under runs/segment/).")
     p.add_argument("--resume", action="store_true", help="Resume from last checkpoint.")
     return p
 
@@ -50,17 +53,22 @@ def main() -> None:
     if not data_yaml.exists():
         raise SystemExit(
             f"data.yaml not found at {data_yaml}.\n"
-            "Run  python prepare_yolo_dataset.py  first."
+            "Run  python prepare_yolo_dataset.py --output yolo_dataset_v3  first."
         )
 
+    # Free memory in PyTorch CUDA cache before initializing training
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     print("=" * 60)
-    print("  YOLOv8 Instance-Segmentation Training")
+    print("  YOLO11 Instance-Segmentation Training (Resource-Optimized)")
     print("=" * 60)
     print(f"  Model      : {args.model}")
     print(f"  Data       : {data_yaml.resolve()}")
     print(f"  Epochs     : {args.epochs}")
     print(f"  Batch size : {args.batch}")
     print(f"  Image size : {args.imgsz}")
+    print(f"  Mask ratio : {args.mask_ratio}")
     print(f"  Patience   : {args.patience}")
     print(f"  Run name   : {args.name}")
     print("=" * 60 + "\n")
@@ -79,8 +87,9 @@ def main() -> None:
         name=args.name,
         project=str(Path("runs/segment").resolve()),
         exist_ok=True,
-        # ---- Mask settings (better for thin ligaments) ----
-        mask_ratio=4,          # default — mask_ratio=2 requires too much VRAM for 6GB GPU
+        amp=True,              # Automatic Mixed Precision (FP16) - significantly reduces VRAM footprint
+        # ---- Mask settings ----
+        mask_ratio=args.mask_ratio,  # default 4 (standard resolution, lower VRAM)
         overlap_mask=False,    # separate mask per instance — avoids merging ligaments
         # ---- Augmentation (tuned for spray + class imbalance) ----
         flipud=0.5,        # vertical flip (spray orientation varies)
