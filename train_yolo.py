@@ -39,8 +39,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch", type=int, default=8, help="Batch size (default: 8, lower to 4 or 2 if VRAM is low).")
     p.add_argument("--imgsz", type=int, default=640, help="Training image size.")
     p.add_argument("--patience", type=int, default=20, help="Early-stopping patience.")
-    p.add_argument("--workers", type=int, default=2, help="Dataloader workers.")
+    p.add_argument("--workers", type=int, default=4, help="Dataloader workers (set to 8 for max CPU throughput).")
     p.add_argument("--mask-ratio", type=int, default=4, help="Mask downsample ratio (default: 4 saves VRAM).")
+    p.add_argument("--cache", action="store_true", help="Cache dataset in RAM to eliminate disk I/O bottlenecks and maximize GPU speed.")
     p.add_argument("--name", default="spray_seg_titan", help="Run name (under runs/segment/).")
     p.add_argument("--resume", action="store_true", help="Resume from last checkpoint.")
     return p
@@ -61,7 +62,7 @@ def main() -> None:
         torch.cuda.empty_cache()
 
     print("=" * 60)
-    print("  YOLO11 Instance-Segmentation Training (Resource-Optimized)")
+    print("  YOLO11 Instance-Segmentation Training")
     print("=" * 60)
     print(f"  Model      : {args.model}")
     print(f"  Data       : {data_yaml.resolve()}")
@@ -69,6 +70,7 @@ def main() -> None:
     print(f"  Batch size : {args.batch}")
     print(f"  Image size : {args.imgsz}")
     print(f"  Mask ratio : {args.mask_ratio}")
+    print(f"  RAM Cache  : {args.cache}")
     print(f"  Patience   : {args.patience}")
     print(f"  Run name   : {args.name}")
     print("=" * 60 + "\n")
@@ -88,6 +90,7 @@ def main() -> None:
         project=str(Path("runs/segment").resolve()),
         exist_ok=True,
         amp=True,              # Automatic Mixed Precision (FP16) - significantly reduces VRAM footprint
+        cache=True if args.cache else False,  # RAM cache eliminates disk read stalls
         # ---- Mask settings ----
         mask_ratio=args.mask_ratio,  # default 4 (standard resolution, lower VRAM)
         overlap_mask=False,    # separate mask per instance — avoids merging ligaments
