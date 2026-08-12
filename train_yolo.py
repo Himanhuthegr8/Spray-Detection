@@ -4,9 +4,9 @@ train_yolo.py
 Train a YOLO11 instance-segmentation model on the prepared spray dataset.
 
 Usage:
-    python train_yolo.py                                    # defaults (yolo11m-seg, batch=8, imgsz=640)
-    python train_yolo.py --batch 4                          # even lower VRAM (~4GB GPU)
-    python train_yolo.py --model yolo11s-seg.pt --batch 4   # small model, extremely fast & low VRAM
+    python train_yolo.py                                    # defaults (yolo11m-seg, batch=4, imgsz=640)
+    python train_yolo.py --batch 8                          # if you have headroom (~16GB+ free VRAM)
+    python train_yolo.py --model yolo11s-seg.pt --batch 8   # small model, fast
     python train_yolo.py --model yolo11n-seg.pt --batch 2   # nano model (ultra low VRAM)
 
 The trained model is saved under  runs/segment/spray_*  inside this directory.
@@ -36,10 +36,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to data.yaml created by prepare_yolo_dataset.py.",
     )
     p.add_argument("--epochs", type=int, default=80, help="Maximum training epochs.")
-    p.add_argument("--batch", type=int, default=8, help="Batch size (default: 8, lower to 4 or 2 if VRAM is low).")
+    p.add_argument("--batch", type=int, default=4, help="Batch size (default: 4 — spray images have thousands of instances per frame).")
     p.add_argument("--imgsz", type=int, default=640, help="Training image size.")
     p.add_argument("--patience", type=int, default=20, help="Early-stopping patience.")
-    p.add_argument("--workers", type=int, default=4, help="Dataloader workers (set to 8 for max CPU throughput).")
+    p.add_argument("--workers", type=int, default=2, help="Dataloader workers.")
     p.add_argument("--mask-ratio", type=int, default=4, help="Mask downsample ratio (default: 4 saves VRAM).")
     p.add_argument("--cache", action="store_true", help="Cache dataset in RAM to eliminate disk I/O bottlenecks and maximize GPU speed.")
     p.add_argument("--name", default="spray_seg_titan", help="Run name (under runs/segment/).")
@@ -89,8 +89,9 @@ def main() -> None:
         name=args.name,
         project=str(Path("runs/segment").resolve()),
         exist_ok=True,
-        amp=True,              # Automatic Mixed Precision (FP16) - significantly reduces VRAM footprint
+        amp=True,              # Automatic Mixed Precision (FP16) - reduces VRAM footprint
         cache=True if args.cache else False,  # RAM cache eliminates disk read stalls
+        pin_memory=False,      # prevent CUDA OOM in pin_memory thread (high instance count)
         # ---- Mask settings ----
         mask_ratio=args.mask_ratio,  # default 4 (standard resolution, lower VRAM)
         overlap_mask=False,    # separate mask per instance — avoids merging ligaments
